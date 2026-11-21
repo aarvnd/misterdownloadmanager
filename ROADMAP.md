@@ -569,6 +569,9 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ With the browser add-on sending downloads to another MDM, pointing at videos no longer adds
+  the page to that MDM's list: only real downloads go there (a list of the message kinds that
+  may, nothing else), and the video button asks this computer's MDM whether to show
 - ✅ The Download video button on Bilibili stays on one corner, clear of the player's feedback
   button, and can be clicked: it looks for a page's controls under the whole of the spot it would
   take, not only its middle and corners ([#1582](https://github.com/anefzaoui/misterdownloadmanager/issues/1582))
