@@ -1,9 +1,11 @@
 //! The certificates secure connections (HTTPS, FTPS, DNS over TLS or HTTPS) check servers with:
-//! the system's. A system without any (a minimal Linux without the `ca-certificates` package,
-//! #264) still gives every client: plain HTTP and FTP work, and each secure connection fails
-//! with [`NO_ROOTS`], which the engine reports as `Error::NoCertificates`. The torrent session's
-//! HTTP clients take the same setup (mdm-torrent), so a session still starts there: DHT, peers
-//! and plain HTTP trackers work, HTTPS trackers fail with [`NO_ROOTS`].
+//! the system's, and Mozilla's ([`mozilla_roots`], the ones Firefox carries) where the system
+//! lacks a server's root (#1546). A system without any (a minimal Linux without the
+//! `ca-certificates` package, #264) still gives every client: plain HTTP and FTP work, and each
+//! secure connection fails with [`NO_ROOTS`], which the engine reports as
+//! `Error::NoCertificates`. The torrent session's HTTP clients take the same setup
+//! (mdm-torrent), so a session still starts there: DHT, peers and plain HTTP trackers work,
+//! HTTPS trackers fail with [`NO_ROOTS`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,18 +41,53 @@ pub fn system_has_roots() -> bool {
     found
 }
 
-/// `builder` with the TLS it can have here: reqwest's own (the system's verifier) when the
-/// system has certificates, else one whose every secure connection fails with [`NO_ROOTS`]
-/// (reqwest's would refuse to build the client at all, plain HTTP included). MDM's own clients
-/// get it through `net::bind_client`; the torrent session's (trackers, UPnP) through librqbit's
-/// `SessionOptions::configure_http_client` (mdm-torrent).
-pub fn configure(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    configure_with(builder, system_has_roots())
+/// Mozilla's trusted root certificates (CCADB's list for websites, as Firefox carries it:
+/// webpki-root-certs), which MDM's verifier trusts besides the system's (#1546). A Windows that
+/// hasn't fetched a root yet (Windows downloads the roots it trusts from Windows Update the first
+/// time a site needs one, and behind a proxy that often fails: Let's Encrypt's ISRG Root X1 and
+/// X2 on an old Windows 10) refused such sites with "unknown issuer" while Firefox opened them.
+///
+/// How the system's verifier (rustls-platform-verifier) takes them, so nothing the system decides
+/// is lost: on Windows they are asked only when Windows' own chain ends in a root it doesn't
+/// trust or know, and the chain is then checked by Windows again, with the same revocation check
+/// and the system's distrusted certificates still refused; on macOS they are anchors beside the
+/// system's, in the same trust evaluation; on Linux they join the system's CA bundle (usually
+/// Mozilla's list too) in one store. The system's own roots stay trusted, so an antivirus's or a
+/// company's HTTPS inspection keeps working.
+pub fn mozilla_roots() -> impl Iterator<Item = CertificateDer<'static>> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned()
 }
 
-fn configure_with(builder: reqwest::ClientBuilder, has_roots: bool) -> reqwest::ClientBuilder {
+/// [`mozilla_roots`] as reqwest takes them, made once.
+fn mozilla_certificates() -> Vec<reqwest::Certificate> {
+    static CERTS: std::sync::OnceLock<Vec<reqwest::Certificate>> = std::sync::OnceLock::new();
+    CERTS
+        .get_or_init(|| {
+            mozilla_roots()
+                .filter_map(|c| reqwest::Certificate::from_der(&c).ok())
+                .collect()
+        })
+        .clone()
+}
+
+/// `builder` with the TLS it can have here: reqwest's own (the system's verifier, with
+/// [`mozilla_roots`] besides) when the system has certificates, else one whose every secure
+/// connection fails with [`NO_ROOTS`] (reqwest's would refuse to build the client at all, plain
+/// HTTP included). MDM's own clients get it through `net::bind_client`; the torrent session's
+/// (trackers, UPnP) through librqbit's `SessionOptions::configure_http_client` (mdm-torrent).
+pub fn configure(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    configure_with(builder, system_has_roots(), mozilla_certificates())
+}
+
+/// `fallback`: the roots trusted besides the system's (Mozilla's; the tests give a test CA in
+/// their place, a root the system doesn't have).
+fn configure_with(
+    builder: reqwest::ClientBuilder,
+    has_roots: bool,
+    fallback: Vec<reqwest::Certificate>,
+) -> reqwest::ClientBuilder {
     if has_roots {
-        builder
+        builder.tls_certs_merge(fallback)
     } else {
         builder.tls_backend_preconfigured(no_roots_config())
     }
@@ -220,7 +257,7 @@ mod tests {
 
     /// A client of a system without certificates.
     fn without_roots() -> reqwest::Client {
-        configure_with(reqwest::Client::builder(), false)
+        configure_with(reqwest::Client::builder(), false, Vec::new())
             .build()
             .expect("a client builds without certificates")
     }
@@ -320,6 +357,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 16 * 1024);
+    }
+
+    /// A client as `configure` makes it, with `fallback` in Mozilla's roots' place.
+    fn configured_with(fallback: Vec<Vec<u8>>) -> reqwest::Client {
+        let fallback = fallback
+            .iter()
+            .map(|der| reqwest::Certificate::from_der(der).unwrap())
+            .collect();
+        configure_with(reqwest::Client::builder(), true, fallback)
+            .build()
+            .unwrap()
+    }
+
+    /// #1546: a server whose chain ends in a root the system doesn't have, but Mozilla's list
+    /// does (the lab's test CA stands for it: it is in no system's store). Without the fallback
+    /// the system refuses it as from an unknown issuer, as an old Windows 10 refused Let's
+    /// Encrypt's; with it, the chain is accepted, and a bad certificate is still refused for
+    /// what is wrong with it, by the system's own verifier (Windows' chain engine checks the
+    /// chain again with the extra roots, macOS's trust evaluation, webpki on Linux).
+    #[tokio::test]
+    async fn a_root_only_mozilla_has_is_trusted_and_bad_certificates_still_refused() {
+        use mdm_labserver::Cert;
+        let good = LabServer::start(Config {
+            tls: true,
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let url = format!("https://localhost:{}/gen/16K", good.addr().port());
+        let ca = good.ca_der().unwrap();
+
+        // The system alone: unknown issuer.
+        let e = configured_with(Vec::new())
+            .get(&url)
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            certificate_problem(&e),
+            Some(CertProblem::Untrusted),
+            "{e:?}"
+        );
+
+        // With the fallback's roots: it downloads.
+        let body = configured_with(vec![ca])
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 16 * 1024);
+
+        // Still refused, each for its own reason, with the fallback trusting the lab's CA.
+        for (cert, want) in [
+            (Cert::Expired, CertProblem::Expired),
+            (Cert::SelfSigned, CertProblem::Untrusted),
+            (Cert::WrongName, CertProblem::WrongName),
+        ] {
+            let lab = LabServer::start(Config {
+                tls: true,
+                cert,
+                ..Config::default()
+            })
+            .await
+            .unwrap();
+            let url = format!("https://localhost:{}/gen/16K", lab.addr().port());
+            let e = configured_with(vec![lab.ca_der().unwrap()])
+                .get(&url)
+                .send()
+                .await
+                .unwrap_err();
+            assert_eq!(certificate_problem(&e), Some(want), "{cert:?}: {e:?}");
+        }
+    }
+
+    /// The fallback is Mozilla's whole list, every certificate of which this system's verifier
+    /// takes: one it refused would leave every client unbuilt. It holds the roots of the chain
+    /// #1546's server sends (Let's Encrypt's YE1, Root YE, cross-signed by ISRG Root X2, itself
+    /// by ISRG Root X1).
+    #[test]
+    fn the_fallback_is_mozillas_list_and_the_system_takes_it() {
+        let all = webpki_root_certs::TLS_SERVER_ROOT_CERTS.len();
+        assert!(all > 100, "{all}");
+        assert_eq!(mozilla_roots().count(), all);
+        assert_eq!(mozilla_certificates().len(), all);
+        for name in [&b"ISRG Root X1"[..], b"ISRG Root X2"] {
+            assert!(
+                mozilla_roots().any(|c| c.windows(name.len()).any(|w| w == name)),
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        configure(reqwest::Client::builder())
+            .build()
+            .expect("the system's verifier takes Mozilla's roots");
+        crate::ftp::client_config(&[]).expect("so does MDM's own TLS configuration");
     }
 
     #[test]
