@@ -4565,6 +4565,14 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
             }
             return Err(Error::FileChanged);
         }
+        // A full body before any part came (the ranges not known yet) whose whole-file digest
+        // isn't the download's: not a server without ranges but another version of the file
+        // (#1646). Taken for one, the download went on with its first connection alone and
+        // nothing said the file had changed. Without a digest on either side it can't be told
+        // from a server that ignores ranges, and goes on as one below.
+        StatusCode::OK if other_version(ctx, &head) => {
+            return Err(Error::FileChanged);
+        }
         StatusCode::OK if ctx.browser.is_some() => {
             browser_ranges_refused(ctx, &head, "answered with the whole file");
             return Err(Error::NoRanges);
@@ -4723,6 +4731,13 @@ fn refused_if_range(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool 
         false => header_str(h, header::LAST_MODIFIED),
     };
     theirs != Some(sent) && resp.len == Some(ctx.size)
+}
+
+/// A full answer that carries a whole-file digest of the same kind as the download's with
+/// another value: another version of the file, whatever the ranges turn out to be.
+fn other_version(ctx: &Ctx, resp: &Head) -> bool {
+    let v = ctx.validators.lock().unwrap();
+    v.same_digest(&digests_of(&resp.headers)) == Some(false)
 }
 
 /// How long an answer from another copy waits for the download to learn its digest.

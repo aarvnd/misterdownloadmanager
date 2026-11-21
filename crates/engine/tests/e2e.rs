@@ -2114,6 +2114,39 @@ async fn changed_file_fails() {
     assert!(matches!(err, mdm_engine::Error::FileChanged), "{err}");
 }
 
+/// #1646: the file changes during the very first burst of requests, before any part has come
+/// (`etag_change_every=2`: the first answer is one version, every ranged request after it gets
+/// the next one whole, its `If-Range` refused). With a whole-file digest on the answers
+/// (`digest=1`) that is a changed file, as it is once a part has come (`changed_file_fails`);
+/// before, those answers read as a server without ranges and the download went on with its
+/// first connection alone, saying nothing.
+#[tokio::test]
+async fn a_file_that_changes_in_the_first_burst_fails_by_its_digest() {
+    let s = server("rate=2M&digest=1&etag_change_every=2").await;
+    let dir = tempfile::tempdir().unwrap();
+    let req = Request {
+        url: s.url("/gen/4M").parse().unwrap(),
+        headers: Default::default(),
+        dest: Destination::Dir(dir.path().to_owned()),
+    };
+    let err = Download::start(req, fast_opts()).wait().await.unwrap_err();
+    assert!(matches!(err, mdm_engine::Error::FileChanged), "{err}");
+    // The ranged requests were all answered whole, with the next version: none was a part.
+    let ranged: Vec<_> = s.log().into_iter().filter(|e| e.range.is_some()).collect();
+    assert!(!ranged.is_empty(), "no ranged request was sent");
+    assert!(ranged.iter().all(|e| e.status == 200), "{ranged:?}");
+}
+
+/// The same without a digest: nothing tells those answers from a server that ignores ranges
+/// (a CDN's nodes each have their own ETag and date, `per_node_etag`), so the download goes on
+/// with its first connection, and what it saves is that connection's version, whole.
+#[tokio::test]
+async fn without_a_digest_a_first_burst_of_whole_answers_is_a_server_without_ranges() {
+    let s = server("rate=2M&etag_change_every=2").await;
+    let (_, size) = fetch(&s, "/gen/4M", 0, fast_opts()).await;
+    assert_eq!(size, 4 << 20);
+}
+
 #[tokio::test]
 async fn speed_limit_caps_the_whole_download() {
     // 8 connections, but the limit is per download (IDM: "for one file").

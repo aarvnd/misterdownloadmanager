@@ -569,6 +569,9 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ A file that changes on the server during a download's very first requests is reported as a
+  changed file, by the whole file's checksum the server sends, instead of the download quietly
+  going on with one connection ([#1646](https://github.com/anefzaoui/misterdownloadmanager/issues/1646))
 - ✅ Windows: bringing a window forward no longer sends a fake Alt key press that programs with
   Alt hotkeys, such as Discord's push-to-talk, picked up (the add-on's Download video and
   Options, a second launch, the tray icon's panel)
