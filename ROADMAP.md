@@ -572,6 +572,9 @@ These ship in the next version.
 - ✅ macOS: file names in Sinhala show their letters on every Mac: its Sinhala font is used by
   name, as Khmer's and Lao's are, where the system's own choice could be a downloaded font MDM
   couldn't find ([#1592](https://github.com/anefzaoui/misterdownloadmanager/issues/1592))
+- ✅ With the browser add-on sending downloads to another MDM, pointing at videos no longer adds
+  the page to that MDM's list: only real downloads go there (a list of the message kinds that
+  may, nothing else), and the video button asks this computer's MDM whether to show
 - ✅ The Download video button on Bilibili stays on one corner, clear of the player's feedback
   button, and can be clicked: it looks for a page's controls under the whole of the spot it would
   take, not only its middle and corners ([#1582](https://github.com/anefzaoui/misterdownloadmanager/issues/1582))
