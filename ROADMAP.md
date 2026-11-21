@@ -569,6 +569,10 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ Tests: the checks of a DNS that never answers ask one on this computer, not an address
+  nobody has: on a network that answers every DNS question itself (a transparent DNS proxy) that
+  address answered, and one check failed while another passed for the wrong reason
+  ([#1653](https://github.com/anefzaoui/misterdownloadmanager/issues/1653))
 - ✅ Windows: bringing a window forward no longer sends a fake Alt key press that programs with
   Alt hotkeys, such as Discord's push-to-talk, picked up (the add-on's Download video and
   Options, a second launch, the tray icon's panel)
