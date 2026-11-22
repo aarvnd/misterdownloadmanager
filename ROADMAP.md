@@ -569,6 +569,10 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ Resume after a crash or a kill continues the download instead of starting it over as
+  "name (1)" (#1705): a row whose name was still to be numbered at start resumes the resume
+  state at that name when it is its own (the same address, no other row at the name), looked at
+  on the download's task; the list is saved as soon as a run's file is named.
 - ✅ Download only a part of a video or a sound, from one time to another, cut quickly at the
   keyframes or exactly (encoded again), from the Download video window and the browser add-on's
   menu over a video ([#1662](https://github.com/anefzaoui/misterdownloadmanager/issues/1662))
