@@ -3424,6 +3424,16 @@ fn link_refused(e: &Error) -> bool {
         || matches!(e, Error::GotWebPage | Error::NotTheFile { .. })
 }
 
+tokio::task_local! {
+    /// The host that answered a first request with a plain 403, and its address that did
+    /// (#1660): set by `get`, read by `FirstAsk::at` around it.
+    static FORBIDDEN_BY: std::cell::Cell<Option<(String, std::net::IpAddr)>>;
+}
+
+fn family_name(v4: bool) -> &'static str {
+    if v4 { "IPv4" } else { "IPv6" }
+}
+
 /// What a download's first request needs besides its address, headers and options.
 struct FirstAsk<'a> {
     as_get: &'a AsGet,
@@ -3451,7 +3461,24 @@ impl FirstAsk<'_> {
     ) -> Result<FirstAnswer, Error> {
         let (shared, cancel, expects) = (self.shared, self.cancel, self.expects);
         let client0 = client(opts, url, self.as_get, self.seen)?;
-        match first_get(&client0, url, headers, opts, expects, shared, cancel).await {
+        let (first, by) = FORBIDDEN_BY
+            .scope(Default::default(), async {
+                let first = first_get(&client0, url, headers, opts, expects, shared, cancel).await;
+                (first, FORBIDDEN_BY.with(|c| c.take()))
+            })
+            .await;
+        // #1660: a 403 may be the link's signature refusing this IP family; the other one is
+        // asked first, since it changes nothing else about the download (its User-Agent stays).
+        let (client0, first) = match first {
+            Err(e) if agent_refused(&e) => {
+                match self.over_other_family(opts, url, headers, by).await? {
+                    Some((client, answer)) => (client, Ok(answer)),
+                    None => (client0, Err(e)),
+                }
+            }
+            first => (client0, first),
+        };
+        match first {
             Err(e) if agent_refused(&e) && opts.agent_fallback.is_some() => {
                 // #372: the rest of the download goes as MDM too.
                 opts.user_agent = opts.agent_fallback.take().unwrap_or_default();
@@ -3463,6 +3490,74 @@ impl FirstAsk<'_> {
                 Ok((client1, first, true))
             }
             first => Ok((client0, first, false)),
+        }
+    }
+
+    /// #1660: the first request once more over the other IP family, after `by` (the host and its
+    /// address) refused it with 403: some file hosts sign a link for the address that loaded
+    /// its page, and a browser that loaded it over IPv4 leaves a link MDM's IPv6 connection is
+    /// refused with (or the other way round). Asked once, only when the host has an address of
+    /// the other family and no proxy carries the request (the host sees the proxy's address
+    /// then). When it answers, the host is kept to that family for the session
+    /// (`dns::keep_to_family`: this download's other connections and the next downloads), with
+    /// the client and answer to go on with; otherwise nothing is changed and the 403 stands.
+    async fn over_other_family(
+        &self,
+        opts: &Options,
+        url: &Url,
+        headers: &HeaderMap,
+        by: Option<(String, std::net::IpAddr)>,
+    ) -> Result<Option<(Client, ((Response, HeaderMap), Duration))>, Error> {
+        let Some((host, used)) = by else {
+            return Ok(None);
+        };
+        if self.seen.proxied() || dns::kept_family(&host).is_some() {
+            return Ok(None);
+        }
+        let port = url.port_or_known_default().unwrap_or(443);
+        let other = dns::has_other_family(
+            &opts.hosts,
+            &opts.dns,
+            &host,
+            port,
+            &opts.extra_roots,
+            &opts.route,
+            used,
+        );
+        if !matches!(
+            cancellable(self.cancel, async {
+                Ok(tokio::time::timeout(opts.connect_timeout, other).await)
+            })
+            .await?,
+            Ok(true)
+        ) {
+            return Ok(None);
+        }
+        let v4 = !used.is_ipv4();
+        dns::keep_to_family(&host, Some(v4));
+        let (shared, cancel) = (self.shared, self.cancel);
+        let again = match client(opts, url, self.as_get, self.seen) {
+            Ok(client) => first_get(&client, url, headers, opts, self.expects, shared, cancel)
+                .await
+                .map(|answer| (client, answer)),
+            Err(e) => Err(e),
+        };
+        match again {
+            Ok(found) => {
+                shared.event(format!(
+                    "{host} refused over {}, downloading over {}",
+                    family_name(!v4),
+                    family_name(v4)
+                ));
+                Ok(Some(found))
+            }
+            Err(e) => {
+                dns::keep_to_family(&host, None);
+                match e {
+                    Error::Cancelled | Error::Adapter(_) => Err(e),
+                    _ => Ok(None),
+                }
+            }
         }
     }
 
@@ -3710,7 +3805,15 @@ async fn get(
                 return Err(Error::Throttled(s, retry_after(resp.headers())));
             }
             s if is_bot_check(s, resp.headers()) => return Err(Error::BotCheck),
-            s => return Err(Error::Status(s)),
+            s => {
+                if s == StatusCode::FORBIDDEN
+                    && let (Some(host), Some(by)) = (from.host_str(), resp.remote_addr())
+                {
+                    // #1660: who refused, for a first request that may ask the other IP family.
+                    let _ = FORBIDDEN_BY.try_with(|c| c.set(Some((host.to_owned(), by.ip()))));
+                }
+                return Err(Error::Status(s));
+            }
         }
         // Where the HTTP redirects ended: the headers' credentials follow as reqwest's did.
         headers = scoped_headers(&headers, &url, &from);

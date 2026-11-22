@@ -3305,3 +3305,154 @@ async fn a_name_only_the_redirected_answer_gives_is_the_files() {
         assert_eq!(out.size, 64 << 10);
     }
 }
+
+/// A lab server on 127.0.0.1 and on ::1 at one port, so that a host name can have an address of
+/// each IP family (#1660); None on a machine without an IPv6 loopback address.
+async fn on_both_families(faults: &str) -> Option<LabServer> {
+    match LabServer::start(Config {
+        both_families: true,
+        faults: Faults::parse(faults).unwrap(),
+        ..Config::default()
+    })
+    .await
+    {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            eprintln!("no IPv6 loopback address here ({e}): not tested");
+            None
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// A download of 2 MB from `s` asked at `host`, whose addresses are `ips` in that order (the
+/// first one is connected to first): how it ended, what its log said, and the server's log.
+async fn get_at_host(
+    s: &LabServer,
+    host: &str,
+    ips: &[&str],
+) -> (
+    Result<mdm_engine::Outcome, mdm_engine::Error>,
+    Vec<String>,
+    Vec<LogEntry>,
+) {
+    use mdm_engine::download::State;
+    s.clear_log();
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{host}:{}/gen/2M/a.bin?seed=1660", s.addr().port());
+    let dl = Download::start(
+        Request {
+            url: url.parse().unwrap(),
+            headers: Default::default(),
+            dest: Destination::Dir(dir.path().to_owned()),
+        },
+        Options {
+            hosts: vec![(
+                host.to_owned(),
+                ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+            )],
+            ..fast_opts()
+        },
+    );
+    let events = loop {
+        let v = dl.snapshot();
+        if matches!(v.state, State::Done | State::Failed | State::Cancelled) {
+            break v.events;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    };
+    let out = dl.wait().await;
+    tokio::time::timeout(SETTLE, s.settled())
+        .await
+        .expect("every request ends");
+    (out, events.into_iter().map(|e| e.text).collect(), s.log())
+}
+
+/// #1660: a link signed for the IPv4 address that loaded its page is refused with 403 over IPv6.
+/// It is asked once more over IPv4 and downloads so, the log says it, and the host's next
+/// download in the session goes over IPv4 from its first request.
+#[tokio::test]
+async fn a_link_refused_over_ipv6_downloads_over_ipv4() {
+    let Some(s) = on_both_families("rate=20M&refuse_family=6").await else {
+        return;
+    };
+    let host = "signed-for-v4.mdm.test";
+    let (out, events, log) = get_at_host(&s, host, &["::1", "127.0.0.1"]).await;
+    assert_eq!(out.expect("downloads over IPv4").size, 2 << 20, "{log:?}");
+    assert!(log[0].peer.is_ipv6() && log[0].status == 403, "{log:?}");
+    assert!(log[1..].iter().all(|e| e.peer.is_ipv4()), "{log:?}");
+    assert_eq!(log.iter().filter(|e| e.status == 403).count(), 1, "{log:?}");
+    let said = format!("{host} refused over IPv6, downloading over IPv4");
+    assert!(events.contains(&said), "{events:?}");
+
+    let (out, events, log) = get_at_host(&s, host, &["::1", "127.0.0.1"]).await;
+    assert_eq!(out.expect("downloads over IPv4").size, 2 << 20, "{log:?}");
+    assert!(log.iter().all(|e| e.peer.is_ipv4()), "{log:?}");
+    assert!(log.iter().all(|e| e.status != 403), "{log:?}");
+    assert!(!events.contains(&said), "{events:?}");
+}
+
+/// #1660, the other way round: a link signed for an IPv6 address, refused over IPv4.
+#[tokio::test]
+async fn a_link_refused_over_ipv4_downloads_over_ipv6() {
+    let Some(s) = on_both_families("rate=20M&refuse_family=4").await else {
+        return;
+    };
+    let host = "signed-for-v6.mdm.test";
+    let (out, events, log) = get_at_host(&s, host, &["127.0.0.1", "::1"]).await;
+    assert_eq!(out.expect("downloads over IPv6").size, 2 << 20, "{log:?}");
+    assert!(log[0].peer.is_ipv4() && log[0].status == 403, "{log:?}");
+    assert!(log[1..].iter().all(|e| e.peer.is_ipv6()), "{log:?}");
+    let said = format!("{host} refused over IPv4, downloading over IPv6");
+    assert!(events.contains(&said), "{events:?}");
+}
+
+/// #1660: a 403 that both families get is the link's own (expired, forbidden). Each family is
+/// asked once, the 403 is the download's error, and the host is kept to neither: its next
+/// download starts over the family it started with.
+#[tokio::test]
+async fn a_403_over_both_families_stands_and_keeps_the_host_to_neither() {
+    let Some(s) = on_both_families("rate=20M&require_cookie=sid=1").await else {
+        return;
+    };
+    let host = "forbidden.mdm.test";
+    let (out, events, log) = get_at_host(&s, host, &["::1", "127.0.0.1"]).await;
+    assert!(
+        matches!(out, Err(mdm_engine::Error::Status(s)) if s.as_u16() == 403),
+        "{out:?}"
+    );
+    let peers: Vec<bool> = log.iter().map(|e| e.peer.is_ipv6()).collect();
+    assert_eq!(peers, [true, false], "{log:?}");
+    assert!(
+        !events.iter().any(|e| e.contains("refused over")),
+        "{events:?}"
+    );
+
+    s.set_faults(Faults::parse("rate=20M").unwrap());
+    let (out, _, log) = get_at_host(&s, host, &["::1", "127.0.0.1"]).await;
+    assert_eq!(out.expect("downloads").size, 2 << 20, "{log:?}");
+    assert!(log.iter().all(|e| e.peer.is_ipv6()), "{log:?}");
+}
+
+/// #1660: a host with addresses of one family only has no other one to ask: its 403 is asked
+/// once. Nor are other refusals asked again over the other family (404 here).
+#[tokio::test]
+async fn only_a_403_of_a_host_with_both_families_is_asked_over_the_other() {
+    let Some(s) = on_both_families("rate=20M&refuse_family=4").await else {
+        return;
+    };
+    let (out, _, log) = get_at_host(&s, "v4-only.mdm.test", &["127.0.0.1"]).await;
+    assert!(
+        matches!(out, Err(mdm_engine::Error::Status(s)) if s.as_u16() == 403),
+        "{out:?}"
+    );
+    assert_eq!(log.len(), 1, "{log:?}");
+
+    s.set_faults(Faults::parse("refuse=404").unwrap());
+    let (out, _, log) = get_at_host(&s, "gone.mdm.test", &["127.0.0.1", "::1"]).await;
+    assert!(
+        matches!(out, Err(mdm_engine::Error::Status(s)) if s.as_u16() == 404),
+        "{out:?}"
+    );
+    assert_eq!(log.len(), 1, "{log:?}");
+}

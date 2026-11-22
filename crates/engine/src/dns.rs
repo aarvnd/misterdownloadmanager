@@ -680,7 +680,7 @@ impl Resolve for Resolver {
                     })??,
                 };
                 // An address of the family the adapter lacks would be connected unbound (#35).
-                let ips = reachable(ips, &dns.route)?;
+                let ips = of_kept_family(&host, reachable(ips, &dns.route)?);
                 let ips = reachable_first(&host, ips, port, &dns.route).await;
                 // Port 0: reqwest then uses the URL's port (a non-zero port here would win).
                 let addrs: Addrs = Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
@@ -691,6 +691,64 @@ impl Resolve for Resolver {
             found
         })
     }
+}
+
+/// The hosts asked over one IP family only for the rest of the session, and whether it is IPv4
+/// (#1660): a host that refused a signed link with 403 over the other family and took it over
+/// this one. Such links are signed for the address that loaded their page, and the browser may
+/// have loaded it over the family MDM's connection didn't pick.
+fn families() -> &'static Mutex<HashMap<String, bool>> {
+    static FAMILIES: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    FAMILIES.get_or_init(Default::default)
+}
+
+/// The IP family `host` is kept to (true: IPv4), if any.
+pub(crate) fn kept_family(host: &str) -> Option<bool> {
+    let host = host.to_ascii_lowercase();
+    families().lock().unwrap().get(&host).copied()
+}
+
+/// Keeps `host` to IPv4 (`Some(true)`) or IPv6 (`Some(false)`) from the next lookup on, in every
+/// client's resolver; `None` lets it use both again.
+pub(crate) fn keep_to_family(host: &str, v4: Option<bool>) {
+    let host = host.to_ascii_lowercase();
+    let mut families = families().lock().unwrap();
+    match v4 {
+        Some(v4) => families.insert(host, v4),
+        None => families.remove(&host),
+    };
+}
+
+/// `ips` of the family `host` is kept to; all of them when it is kept to none, or has no address
+/// of that family any more (its addresses changed: better the other family than no download).
+fn of_kept_family(host: &str, ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    match kept_family(host) {
+        Some(v4) if ips.iter().any(|ip| ip.is_ipv4() == v4) => {
+            ips.into_iter().filter(|ip| ip.is_ipv4() == v4).collect()
+        }
+        _ => ips,
+    }
+}
+
+/// Whether `host` has an address of the other IP family than `used`'s that `route` reaches, by
+/// its fixed addresses (`hosts`) or else as `choice` finds them. Not so for an IP address, nor
+/// when the lookup fails.
+pub(crate) async fn has_other_family(
+    hosts: &[(String, Vec<IpAddr>)],
+    choice: &DnsChoice,
+    host: &str,
+    port: u16,
+    extra_roots: &[Vec<u8>],
+    route: &Route,
+    used: IpAddr,
+) -> bool {
+    let ips = match hosts.iter().find(|(h, _)| h.eq_ignore_ascii_case(host)) {
+        Some((_, ips)) => route.keep(ips.clone()),
+        None => lookup(choice, host, port, extra_roots, route)
+            .await
+            .unwrap_or_default(),
+    };
+    ips.iter().any(|ip| ip.is_ipv4() != used.is_ipv4())
 }
 
 fn winners() -> &'static Mutex<HashMap<String, (IpAddr, Instant)>> {
@@ -970,5 +1028,34 @@ mod tests {
             vec![ip]
         );
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+    /// #1660: a host kept to one IP family gets its addresses of that family only, in every
+    /// lookup; one that has none of them any more keeps what it has.
+    #[test]
+    fn a_host_kept_to_a_family_gets_only_its_addresses() {
+        let ips =
+            |list: &[&str]| -> Vec<IpAddr> { list.iter().map(|ip| ip.parse().unwrap()).collect() };
+        let both = ips(&["2001:db8::1", "192.0.2.1", "2001:db8::2", "192.0.2.2"]);
+        let host = "kept.mdm.test";
+        assert_eq!(kept_family(host), None);
+        assert_eq!(of_kept_family(host, both.clone()), both);
+        keep_to_family("Kept.MDM.test", Some(true));
+        assert_eq!(kept_family(host), Some(true));
+        assert_eq!(
+            of_kept_family(host, both.clone()),
+            ips(&["192.0.2.1", "192.0.2.2"])
+        );
+        assert_eq!(
+            of_kept_family(host, ips(&["2001:db8::1"])),
+            ips(&["2001:db8::1"])
+        );
+        assert_eq!(of_kept_family("other.mdm.test", both.clone()), both);
+        keep_to_family(host, Some(false));
+        assert_eq!(
+            of_kept_family(host, both.clone()),
+            ips(&["2001:db8::1", "2001:db8::2"])
+        );
+        keep_to_family(host, None);
+        assert_eq!(of_kept_family(host, both.clone()), both);
     }
 }

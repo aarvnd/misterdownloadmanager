@@ -569,6 +569,12 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ A link signed for the page's IPv4 address no longer fails with 403 over IPv6 (#1660): a
+  download's first request refused with 403 by a host that has addresses of both IP families is
+  asked once over the other one; when that works the log says so and the host keeps that family
+  for the session. A 403 over both stands, no other error is asked again this way, never through
+  a proxy. The lab server listens on both families (`--both-families`) with a `refuse_family`
+  fault for it.
 - ✅ macOS checked for real on GitHub's Macs (Apple Silicon and Intel): a workflow builds MDM there,
   runs a download to its end and checks the file, the automation API, the command line, the
   windows and quitting, takes pictures of every window in light, dark and the style themes and a
