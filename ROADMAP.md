@@ -577,6 +577,9 @@ These ship in the next version.
   the kept family switches it back. A 403 over both stands, no other error is asked again this
   way, never through a proxy; an adapter that can't reach the other family is named in the log.
   The lab server listens on both families (`--both-families`) with a `refuse_family` fault.
+- ✅ Download only a part of a video or a sound, from one time to another, cut quickly at the
+  keyframes or exactly (encoded again), from the Download video window and the browser add-on's
+  menu over a video ([#1662](https://github.com/anefzaoui/misterdownloadmanager/issues/1662))
 - ✅ A file that changes on the server during a download's very first requests is reported as a
   changed file, by the whole file's checksum the server sends, instead of the download quietly
   going on with one connection ([#1646](https://github.com/anefzaoui/misterdownloadmanager/issues/1646))
