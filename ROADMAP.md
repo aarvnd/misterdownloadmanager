@@ -575,6 +575,9 @@ These ship in the next version.
   for the session. A 403 over both stands, no other error is asked again this way, never through
   a proxy. The lab server listens on both families (`--both-families`) with a `refuse_family`
   fault for it.
+- ✅ A file that changes on the server during a download's very first requests is reported as a
+  changed file, by the whole file's checksum the server sends, instead of the download quietly
+  going on with one connection ([#1646](https://github.com/anefzaoui/misterdownloadmanager/issues/1646))
 - ✅ macOS checked for real on GitHub's Macs (Apple Silicon and Intel): a workflow builds MDM there,
   runs a download to its end and checks the file, the automation API, the command line, the
   windows and quitting, takes pictures of every window in light, dark and the style themes and a
