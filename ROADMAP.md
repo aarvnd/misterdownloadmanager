@@ -572,6 +572,11 @@ These ship in the next version.
 - ✅ A file that changes on the server during a download's very first requests is reported as a
   changed file, by the whole file's checksum the server sends, instead of the download quietly
   going on with one connection ([#1646](https://github.com/anefzaoui/misterdownloadmanager/issues/1646))
+- ✅ macOS checked for real on GitHub's Macs (Apple Silicon and Intel): a workflow builds MDM there,
+  runs a download to its end and checks the file, the automation API, the command line, the
+  windows and quitting, takes pictures of every window in light, dark and the style themes and a
+  screen recording, and installs the release's .dmg files as a person does and checks them, so a
+  change can be verified on macOS before it's merged
 - ✅ Tests: the checks of a DNS that never answers ask one on this computer, not an address
   nobody has: on a network that answers every DNS question itself (a transparent DNS proxy) that
   address answered, and one check failed while another passed for the wrong reason
@@ -584,9 +589,18 @@ These ship in the next version.
   pieces they share with ticked files are kept in a parts file of MDM's own, and a file ticked
   later, while the torrent downloads or once it has finished, is made then and gets them from
   there ([#1567](https://github.com/anefzaoui/misterdownloadmanager/pull/1567))
+- ✅ Torrents through a debrid account: only the files ticked in Add torrent are downloaded
+  (Real-Debrid's `selectFiles` gets their ids; every service's files are matched by path), the
+  choice kept in the list, the download's size theirs; a ticked file the service doesn't list
+  stops the download with its name rather than taking every file
+  ([#1640](https://github.com/anefzaoui/misterdownloadmanager/issues/1640))
 - ✅ Torrents: a torrent added again while it downloads (a file ticked, trackers added, its
   folder moved) keeps every piece it has, not only those of librqbit's last saved piece map
   ([#1623](https://github.com/anefzaoui/misterdownloadmanager/issues/1623))
+- ✅ Torrents: while a torrent is added again with its pieces kept (a file ticked, trackers
+  added), its progress stays what it had, not 0.00 % while the session checks a sample of
+  them; the log says when its piece map can't be written back
+  ([#1648](https://github.com/anefzaoui/misterdownloadmanager/issues/1648))
 - ✅ Downloads from servers that keep several copies of a file, each with its own version tag
   and date (ModelScope's), go on with all their connections when the copies carry the same
   checksum of the whole file, checked on every part, instead of stopping with "the file changed
@@ -1398,6 +1412,9 @@ These ship in the next version.
   (as many as a file's connections), AES-128 pieces decrypted, expired pieces' addresses asked of
   yt-dlp again ([#531](https://github.com/anefzaoui/misterdownloadmanager/issues/531), part of
   [#769](https://github.com/anefzaoui/misterdownloadmanager/issues/769))
+- ✅ YouTube videos with an ad before them come down through MDM's own downloader: it waits, as
+  yt-dlp does, until YouTube serves their streams (403 before then)
+  ([#1655](https://github.com/anefzaoui/misterdownloadmanager/issues/1655))
 - ✅ Image galleries through MDM's own downloader: gallery-dl lists the pictures, MDM brings
   them in 4 at a time under the speed limits, gallery-dl fetches only what is left
   ([#769](https://github.com/anefzaoui/misterdownloadmanager/issues/769))
@@ -1833,6 +1850,9 @@ These ship in the next version.
   no sliver of the face outside them; Luna's active bar has XP's brighter light band and rows,
   and its buttons a pure white edge
   ([#1612](https://github.com/anefzaoui/misterdownloadmanager/issues/1612))
+- ✅ Dialogs show their file icons while the main window is minimized, and the log no longer
+  fills with `Failed to find texture` / `Missing texture` lines, with OpenGL and Direct3D
+  ([#1639](https://github.com/anefzaoui/misterdownloadmanager/issues/1639))
 
 ## Being worked on
 
