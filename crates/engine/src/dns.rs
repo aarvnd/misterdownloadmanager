@@ -680,6 +680,7 @@ impl Resolve for Resolver {
                     })??,
                 };
                 // An address of the family the adapter lacks would be connected unbound (#35).
+                found().lock().unwrap().insert(host.clone(), ips.clone());
                 let ips = of_kept_family(&host, reachable(ips, &dns.route)?);
                 let ips = reachable_first(&host, ips, port, &dns.route).await;
                 // Port 0: reqwest then uses the URL's port (a non-zero port here would win).
@@ -703,14 +704,14 @@ fn families() -> &'static Mutex<HashMap<String, bool>> {
 }
 
 /// The IP family `host` is kept to (true: IPv4), if any.
-pub(crate) fn kept_family(host: &str) -> Option<bool> {
+pub fn kept_family(host: &str) -> Option<bool> {
     let host = host.to_ascii_lowercase();
     families().lock().unwrap().get(&host).copied()
 }
 
 /// Keeps `host` to IPv4 (`Some(true)`) or IPv6 (`Some(false)`) from the next lookup on, in every
-/// client's resolver; `None` lets it use both again.
-pub(crate) fn keep_to_family(host: &str, v4: Option<bool>) {
+/// client's resolver; `None` lets it use both again (as a new session does: tests).
+pub fn keep_to_family(host: &str, v4: Option<bool>) {
     let host = host.to_ascii_lowercase();
     let mut families = families().lock().unwrap();
     match v4 {
@@ -730,25 +731,50 @@ fn of_kept_family(host: &str, ips: Vec<IpAddr>) -> Vec<IpAddr> {
     }
 }
 
-/// Whether `host` has an address of the other IP family than `used`'s that `route` reaches, by
-/// its fixed addresses (`hosts`) or else as `choice` finds them. Not so for an IP address, nor
-/// when the lookup fails.
-pub(crate) async fn has_other_family(
-    hosts: &[(String, Vec<IpAddr>)],
-    choice: &DnsChoice,
-    host: &str,
-    port: u16,
-    extra_roots: &[Vec<u8>],
-    route: &Route,
-    used: IpAddr,
-) -> bool {
-    let ips = match hosts.iter().find(|(h, _)| h.eq_ignore_ascii_case(host)) {
-        Some((_, ips)) => route.keep(ips.clone()),
-        None => lookup(choice, host, port, extra_roots, route)
-            .await
-            .unwrap_or_default(),
-    };
-    ips.iter().any(|ip| ip.is_ipv4() != used.is_ipv4())
+/// Every address each host was found to have at its last lookup by a client's resolver, before
+/// any is left out (the adapter's family, the family the host is kept to): what
+/// [`other_family`] goes by.
+fn found() -> &'static Mutex<HashMap<String, Vec<IpAddr>>> {
+    static FOUND: OnceLock<Mutex<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+    FOUND.get_or_init(Default::default)
+}
+
+/// Whether a host that refused a request can be asked over the other IP family (#1660).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OtherFamily {
+    /// It has an address of the other family, which the route reaches.
+    Has,
+    /// It has addresses of the other family, but the chosen adapter (its label) reaches none.
+    Unreachable(String),
+    /// It has none, or the address that refused isn't one of its own: a proxy's (HTTP, SOCKS,
+    /// PAC or the system's alike), which the host sees instead of this computer.
+    No,
+}
+
+/// [`OtherFamily`] for `host`, refused by its address `by`: by the addresses the client's
+/// resolver last found for it, so no lookup is made (and none could differ from the client's).
+pub(crate) fn other_family(host: &str, by: IpAddr, route: &Route) -> OtherFamily {
+    let host = host.to_ascii_lowercase();
+    let all = found()
+        .lock()
+        .unwrap()
+        .get(&host)
+        .cloned()
+        .unwrap_or_default();
+    if !all.contains(&by) {
+        return OtherFamily::No;
+    }
+    let others: Vec<IpAddr> = all
+        .into_iter()
+        .filter(|ip| ip.is_ipv4() != by.is_ipv4())
+        .collect();
+    match others.is_empty() {
+        true => OtherFamily::No,
+        false if route.keep(others).is_empty() => {
+            OtherFamily::Unreachable(route.label().unwrap_or_default().to_owned())
+        }
+        false => OtherFamily::Has,
+    }
 }
 
 fn winners() -> &'static Mutex<HashMap<String, (IpAddr, Instant)>> {
@@ -1057,5 +1083,46 @@ mod tests {
         );
         keep_to_family(host, None);
         assert_eq!(of_kept_family(host, both.clone()), both);
+    }
+    /// #1660: the other family is asked only of a host the refusing address is one of, that
+    /// has an address of the other family, which the adapter reaches.
+    #[test]
+    fn the_other_family_is_the_refusing_hosts_own_and_reachable() {
+        let ips =
+            |list: &[&str]| -> Vec<IpAddr> { list.iter().map(|ip| ip.parse().unwrap()).collect() };
+        let set = |host: &str, list: &[&str]| {
+            found().lock().unwrap().insert(host.to_owned(), ips(list));
+        };
+        let (v4, v6): (IpAddr, IpAddr) =
+            ("192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap());
+        set("both.other.test", &["192.0.2.1", "2001:db8::1"]);
+        set("one.other.test", &["192.0.2.1", "192.0.2.2"]);
+        let any = Route::Any;
+        assert_eq!(other_family("Both.other.test", v6, &any), OtherFamily::Has);
+        assert_eq!(other_family("both.other.test", v4, &any), OtherFamily::Has);
+        assert_eq!(other_family("one.other.test", v4, &any), OtherFamily::No);
+        // Never looked up by a client (a proxy was asked), or answered by another address (a
+        // proxy's): not the host's own refusal of this computer's address.
+        assert_eq!(
+            other_family("unknown.other.test", v6, &any),
+            OtherFamily::No
+        );
+        let proxy: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(
+            other_family("both.other.test", proxy, &any),
+            OtherFamily::No
+        );
+        // An adapter with an IPv4 address only can't take the IPv4 host's IPv6 refusal further.
+        let v6_only = Route::Bound(Arc::new(crate::net::Binding {
+            label: "Tunnel".into(),
+            v6: Some("2001:db8::9".parse().unwrap()),
+            ..Default::default()
+        }));
+        if !cfg!(windows) {
+            assert_eq!(
+                other_family("both.other.test", v6, &v6_only),
+                OtherFamily::Unreachable("Tunnel".into())
+            );
+        }
     }
 }

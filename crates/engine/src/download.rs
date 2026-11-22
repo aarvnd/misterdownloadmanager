@@ -952,6 +952,9 @@ pub struct KeptAnswer {
     unlocked: Option<crate::unlock::Unlocked>,
     /// What its client learnt of the server (#140): the download goes on with it.
     seen: Arc<crate::server::ServerSeen>,
+    /// The look's host refused it over one IP family and answered over the other (#1660): what
+    /// the download's log says of it.
+    family_said: Option<String>,
 }
 
 impl std::fmt::Debug for KeptAnswer {
@@ -1013,8 +1016,7 @@ pub async fn probe_kept(
     );
     // Where the look asked, and with what: asked again there if the site refuses (#668).
     let (asked_at, asked_with) = (target.clone(), headers.clone());
-    // A browser's User-Agent refused (#372): asked once more as MDM.
-    let (client, asked) = match get(
+    let (asked, by) = noting_refuser(get(
         &client,
         target.clone(),
         headers.clone(),
@@ -1022,9 +1024,31 @@ pub async fn probe_kept(
         first_opts.site_agent(),
         expects,
         &CancellationToken::new(),
-    )
-    .await
-    {
+    ))
+    .await;
+    // #1660: a 403 that may be this IP family's is asked once over the other one, as the
+    // download's first request is (`FirstAsk::at`).
+    let mut family_said = None;
+    let (client, asked) = match asked {
+        Err(e) if agent_refused(&e) => {
+            let cancel = CancellationToken::new();
+            match get_over_other_family(
+                first_opts, &target, &headers, &as_get, &seen, expects, by, &cancel,
+            )
+            .await?
+            {
+                OtherFamilyAsk::Answered(answered) => {
+                    let (client, answer, said) = *answered;
+                    family_said = Some(said);
+                    (client, Ok(answer))
+                }
+                OtherFamilyAsk::No(_) => (client, Err(e)),
+            }
+        }
+        asked => (client, asked),
+    };
+    // A browser's User-Agent refused (#372): asked once more as MDM.
+    let (client, asked) = match asked {
         Err(e) if agent_refused(&e) && first_opts.agent_fallback.is_some() => {
             let mut plain = opts.clone();
             plain.user_agent = opts.agent_fallback.clone().unwrap_or_default();
@@ -1056,7 +1080,10 @@ pub async fn probe_kept(
             }
             let cancel = CancellationToken::new();
             match browser_ask(opts, &asked_at, &asked_with, expects, &cancel).await {
-                Ok((b, (head, body, headers, took))) => (head, body, Some(b), headers, took),
+                Ok((b, (head, body, headers, took), said)) => {
+                    family_said = said;
+                    (head, body, Some(b), headers, took)
+                }
                 Err(other @ (Error::Cancelled | Error::Adapter(_))) => return Err(other),
                 // #1422: refused that way too; once more under MDM's own name, the last try.
                 Err(_) => match own.filter(|_| as_own.is_none()) {
@@ -1132,6 +1159,7 @@ pub async fn probe_kept(
         url,
         client,
         seen,
+        family_said,
         as_get,
         head,
         body,
@@ -2203,6 +2231,9 @@ async fn run_fresh(
                 "Connection 1: continuing from the answer the file's information window got",
             );
             let _ = shared.seen.set(k.seen);
+            if let Some(said) = k.family_said {
+                shared.event(said);
+            }
             browser = k.browser;
             // The look got through under MDM's own name (#1422): so does the rest.
             if let Some(own) = k.own_agent {
@@ -2468,6 +2499,7 @@ async fn run_fresh(
         saved.asked_as_mdm = asked_as_mdm;
         saved.asked_as_own = asked_own;
         saved.browser_like = browser.is_some();
+        saved.ipv4 = final_url.host_str().and_then(dns::kept_family);
         let ctx = Arc::new(Ctx {
             client: client0.clone(),
             validators: Mutex::new(validators),
@@ -2784,6 +2816,18 @@ async fn run_resume(
             "Going on under Mister Download Manager's own name, as the site's bot check asked",
         );
         opts = speaking_own(&opts, own);
+    }
+    // #1660: its host answered over one IP family only, in a session that may be over: asked
+    // over it again, unless this session learnt otherwise since.
+    if let (Some(v4), Some(host)) = (saved.ipv4, saved.final_url.host_str())
+        && dns::kept_family(host).is_none()
+    {
+        dns::keep_to_family(host, Some(v4));
+        shared.event(format!(
+            "Going on over {}: {host} refused the link over {}",
+            family_name(v4),
+            family_name(!v4)
+        ));
     }
     shared.limiter.set(opts.speed_limit);
     let bad = |what: &str| Error::BadState(format!("{}: {what}", state_file.display()));
@@ -3427,11 +3471,136 @@ fn link_refused(e: &Error) -> bool {
 tokio::task_local! {
     /// The host that answered a first request with a plain 403, and its address that did
     /// (#1660): set by `get`, read by `FirstAsk::at` around it.
-    static FORBIDDEN_BY: std::cell::Cell<Option<(String, std::net::IpAddr)>>;
+    static FORBIDDEN_BY: std::cell::Cell<Option<Refuser>>;
 }
+
+/// Who refused a request with a plain 403: the host, and its address that answered.
+type Refuser = (String, std::net::IpAddr);
 
 fn family_name(v4: bool) -> &'static str {
     if v4 { "IPv4" } else { "IPv6" }
+}
+
+/// #1660: a host being asked over its other IP family, after it refused a request with a plain
+/// 403. Some file hosts sign a link for the address that loaded its page, and a browser that
+/// loaded it over IPv4 leaves a link MDM's IPv6 connection is refused with (or the other way
+/// round): a fresh link that looks expired.
+///
+/// From [`FamilySwitch::begin`] on, every client's resolver hands on the host's addresses of the
+/// other family only (`dns::keep_to_family`), so the one more request is made with a new
+/// client (no kept-alive socket of the refused family). It is made once, without the retries of
+/// a temporary failure. When it is answered the host stays so for the session (this download's
+/// other connections, the next downloads; the resume state keeps it for another session) and
+/// [`FamilySwitch::said`] goes to the log; otherwise [`FamilySwitch::undo`] puts back what was,
+/// and the 403 goes on as it did. A host kept to a family is switched the same way, so a later
+/// link signed for the other family downloads too: whichever family last worked is kept.
+struct FamilySwitch {
+    host: String,
+    v4: bool,
+    before: Option<bool>,
+}
+
+impl FamilySwitch {
+    /// Begun when the host has an address of the other family that the chosen adapter reaches
+    /// and the refusal came from the host itself (never through a proxy, whose address the host
+    /// sees: `dns::other_family`). Otherwise what the log should say of it, if anything: an
+    /// adapter that can't reach the other family.
+    fn begin(opts: &Options, by: Option<Refuser>) -> Result<FamilySwitch, Option<String>> {
+        let Some((host, by)) = by else {
+            return Err(None);
+        };
+        let v4 = !by.is_ipv4();
+        match dns::other_family(&host, by, &opts.route) {
+            dns::OtherFamily::Has => {
+                let before = dns::kept_family(&host);
+                dns::keep_to_family(&host, Some(v4));
+                Ok(FamilySwitch { host, v4, before })
+            }
+            dns::OtherFamily::Unreachable(adapter) => Err(Some(format!(
+                "{host} refused over {}; its {} addresses can't be reached through {adapter}",
+                family_name(!v4),
+                family_name(v4),
+            ))),
+            dns::OtherFamily::No => Err(None),
+        }
+    }
+
+    fn said(&self) -> String {
+        format!(
+            "{} refused over {}, downloading over {}",
+            self.host,
+            family_name(!self.v4),
+            family_name(self.v4)
+        )
+    }
+
+    fn undo(self) {
+        dns::keep_to_family(&self.host, self.before);
+    }
+}
+
+/// `asking` (a `get`), with who refused it with a plain 403, if someone did.
+async fn noting_refuser<T>(asking: impl Future<Output = T>) -> (T, Option<Refuser>) {
+    FORBIDDEN_BY
+        .scope(Default::default(), async {
+            let got = asking.await;
+            (got, FORBIDDEN_BY.with(|c| c.take()))
+        })
+        .await
+}
+
+/// What asking over the other IP family came to ([`FamilySwitch`]).
+enum OtherFamilyAsk {
+    /// Answered: the client and answer to go on with, and what the log says.
+    Answered(Box<(Client, (Response, HeaderMap, Duration), String)>),
+    /// Not asked, or not answered: the 403 stands. With what the log says of it, if anything.
+    No(Option<String>),
+}
+
+/// #1660: `get` once more over the other IP family, after `by` refused it with 403
+/// ([`FamilySwitch`]): one request with a new client, never retried.
+#[allow(clippy::too_many_arguments)]
+async fn get_over_other_family(
+    opts: &Options,
+    url: &Url,
+    headers: &HeaderMap,
+    as_get: &AsGet,
+    seen: &Arc<crate::server::ServerSeen>,
+    expects: bool,
+    by: Option<Refuser>,
+    cancel: &CancellationToken,
+) -> Result<OtherFamilyAsk, Error> {
+    let switch = match FamilySwitch::begin(opts, by) {
+        Ok(switch) => switch,
+        Err(said) => return Ok(OtherFamilyAsk::No(said)),
+    };
+    let again = match client(opts, url, as_get, seen) {
+        Ok(client) => {
+            let (url, headers) = (url.clone(), headers.clone());
+            let (post, agent) = (opts.post.as_ref(), opts.site_agent());
+            cancellable(
+                cancel,
+                get(&client, url, headers, post, agent, expects, cancel),
+            )
+            .await
+            .map(|answer| (client, answer))
+        }
+        Err(e) => Err(e),
+    };
+    match again {
+        Ok((client, answer)) => Ok(OtherFamilyAsk::Answered(Box::new((
+            client,
+            answer,
+            switch.said(),
+        )))),
+        Err(e) => {
+            switch.undo();
+            match e {
+                Error::Cancelled | Error::Adapter(_) => Err(e),
+                _ => Ok(OtherFamilyAsk::No(None)),
+            }
+        }
+    }
 }
 
 /// What a download's first request needs besides its address, headers and options.
@@ -3461,19 +3630,33 @@ impl FirstAsk<'_> {
     ) -> Result<FirstAnswer, Error> {
         let (shared, cancel, expects) = (self.shared, self.cancel, self.expects);
         let client0 = client(opts, url, self.as_get, self.seen)?;
-        let (first, by) = FORBIDDEN_BY
-            .scope(Default::default(), async {
-                let first = first_get(&client0, url, headers, opts, expects, shared, cancel).await;
-                (first, FORBIDDEN_BY.with(|c| c.take()))
-            })
-            .await;
+        let (first, by) = noting_refuser(first_get(
+            &client0, url, headers, opts, expects, shared, cancel,
+        ))
+        .await;
         // #1660: a 403 may be the link's signature refusing this IP family; the other one is
         // asked first, since it changes nothing else about the download (its User-Agent stays).
         let (client0, first) = match first {
             Err(e) if agent_refused(&e) => {
-                match self.over_other_family(opts, url, headers, by).await? {
-                    Some((client, answer)) => (client, Ok(answer)),
-                    None => (client0, Err(e)),
+                let (as_get, seen) = (self.as_get, self.seen);
+                match get_over_other_family(opts, url, headers, as_get, seen, expects, by, cancel)
+                    .await?
+                {
+                    OtherFamilyAsk::Answered(answered) => {
+                        let (client, (resp, headers, took), said) = *answered;
+                        shared.event(said);
+                        // As `first_get` checks its answer (#1460).
+                        let sized =
+                            answer_size(resp.status(), resp.headers(), resp.content_length());
+                        let checked = sized.map_or(Ok(()), |s| not_the_file(opts.expected_size, s));
+                        (client, checked.map(|()| ((resp, headers), took)))
+                    }
+                    OtherFamilyAsk::No(said) => {
+                        if let Some(said) = said {
+                            shared.event(said);
+                        }
+                        (client0, Err(e))
+                    }
                 }
             }
             first => (client0, first),
@@ -3490,74 +3673,6 @@ impl FirstAsk<'_> {
                 Ok((client1, first, true))
             }
             first => Ok((client0, first, false)),
-        }
-    }
-
-    /// #1660: the first request once more over the other IP family, after `by` (the host and its
-    /// address) refused it with 403: some file hosts sign a link for the address that loaded
-    /// its page, and a browser that loaded it over IPv4 leaves a link MDM's IPv6 connection is
-    /// refused with (or the other way round). Asked once, only when the host has an address of
-    /// the other family and no proxy carries the request (the host sees the proxy's address
-    /// then). When it answers, the host is kept to that family for the session
-    /// (`dns::keep_to_family`: this download's other connections and the next downloads), with
-    /// the client and answer to go on with; otherwise nothing is changed and the 403 stands.
-    async fn over_other_family(
-        &self,
-        opts: &Options,
-        url: &Url,
-        headers: &HeaderMap,
-        by: Option<(String, std::net::IpAddr)>,
-    ) -> Result<Option<(Client, ((Response, HeaderMap), Duration))>, Error> {
-        let Some((host, used)) = by else {
-            return Ok(None);
-        };
-        if self.seen.proxied() || dns::kept_family(&host).is_some() {
-            return Ok(None);
-        }
-        let port = url.port_or_known_default().unwrap_or(443);
-        let other = dns::has_other_family(
-            &opts.hosts,
-            &opts.dns,
-            &host,
-            port,
-            &opts.extra_roots,
-            &opts.route,
-            used,
-        );
-        if !matches!(
-            cancellable(self.cancel, async {
-                Ok(tokio::time::timeout(opts.connect_timeout, other).await)
-            })
-            .await?,
-            Ok(true)
-        ) {
-            return Ok(None);
-        }
-        let v4 = !used.is_ipv4();
-        dns::keep_to_family(&host, Some(v4));
-        let (shared, cancel) = (self.shared, self.cancel);
-        let again = match client(opts, url, self.as_get, self.seen) {
-            Ok(client) => first_get(&client, url, headers, opts, self.expects, shared, cancel)
-                .await
-                .map(|answer| (client, answer)),
-            Err(e) => Err(e),
-        };
-        match again {
-            Ok(found) => {
-                shared.event(format!(
-                    "{host} refused over {}, downloading over {}",
-                    family_name(!v4),
-                    family_name(v4)
-                ));
-                Ok(Some(found))
-            }
-            Err(e) => {
-                dns::keep_to_family(&host, None);
-                match e {
-                    Error::Cancelled | Error::Adapter(_) => Err(e),
-                    _ => Ok(None),
-                }
-            }
         }
     }
 
@@ -3662,7 +3777,7 @@ async fn browser_first(
     shared.event(format!(
         "{host}: {refused}; asking once more the way a browser connects"
     ));
-    let (b, asked) = match browser_ask(opts, url, headers, expects, cancel).await {
+    let (b, asked, said) = match browser_ask(opts, url, headers, expects, cancel).await {
         Ok(got) => got,
         Err(e @ (Error::Cancelled | Error::Adapter(_))) => return Err(e),
         Err(e) => {
@@ -3671,6 +3786,9 @@ async fn browser_first(
         }
     };
     let (head, body, headers, took) = asked;
+    if let Some(said) = said {
+        shared.event(said);
+    }
     shared.event(format!(
         "{host}: the browser-like connection got through; downloading on it"
     ));
@@ -3689,15 +3807,45 @@ async fn browser_ask(
     (
         Arc<crate::browserlike::Browser>,
         (Head, Body, HeaderMap, Duration),
+        Option<String>,
     ),
     Error,
 > {
     let b = Arc::new(crate::browserlike::Browser::new(opts, url, headers)?);
     let asked = std::time::Instant::now();
-    let (head, body, headers) = b.get(url.clone(), headers.clone(), false, cancel).await?;
+    let (head, body, with) = b.get(url.clone(), headers.clone(), false, cancel).await?;
     let took = asked.elapsed();
+    // #1660: past the bot check, the link's own 403 may be this IP family's: asked once over
+    // the other one, on a browser-like connection of its own.
+    let by = (head.status == StatusCode::FORBIDDEN && !is_bot_check(head.status, &head.headers))
+        .then(|| Some((head.url.host_str()?.to_owned(), head.from?.ip())))
+        .flatten();
+    let said = match FamilySwitch::begin(opts, by) {
+        Ok(switch) => {
+            drop(body);
+            let b = Arc::new(crate::browserlike::Browser::new(opts, url, headers)?);
+            let asked = std::time::Instant::now();
+            let again = match b.get(url.clone(), headers.clone(), false, cancel).await {
+                Ok((head, body, with)) => crate::browserlike::check_first(&head, expects)
+                    .map(|()| (head, body, with, asked.elapsed())),
+                Err(e) => Err(e),
+            };
+            match again {
+                Ok(answer) => return Ok((b, answer, Some(switch.said()))),
+                Err(e) => {
+                    switch.undo();
+                    if matches!(e, Error::Cancelled | Error::Adapter(_)) {
+                        return Err(e);
+                    }
+                    // The 403 stands, as `check_first` tells it.
+                    return Err(Error::Status(head.status));
+                }
+            }
+        }
+        Err(said) => said,
+    };
     crate::browserlike::check_first(&head, expects)?;
-    Ok((b, (head, body, headers, took)))
+    Ok((b, (head, body, with, took), said))
 }
 
 /// A plain `GET` (no Range), or a POST of `post`, that must answer 200 or 206. A GET follows

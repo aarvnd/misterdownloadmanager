@@ -71,12 +71,6 @@ impl ServerSeen {
         self.inner.lock().unwrap().server.proxied = proxied;
     }
 
-    /// Whether a proxy carries the download's requests: its answers then come from the proxy's
-    /// address, not the server's.
-    pub(crate) fn proxied(&self) -> bool {
-        self.inner.lock().unwrap().server.proxied
-    }
-
     fn connected_in(&self, d: Duration) {
         let mut s = self.inner.lock().unwrap();
         if s.quickest.is_none_or(|q| d < q) {
