@@ -577,6 +577,12 @@ These ship in the next version.
   the kept family switches it back. A 403 over both stands, no other error is asked again this
   way, never through a proxy; an adapter that can't reach the other family is named in the log.
   The lab server listens on both families (`--both-families`) with a `refuse_family` fault.
+- ✅ Website and help: what to do when an antivirus flags MDM (why it happens, how to check your
+  copy against the release's checksums, where to report the false alarm), linked from the README
+- ✅ Website: the home page shows MDM's one-minute film under its first view; YouTube's player
+  loads only when the visitor presses play, and the privacy policy says so
+- ✅ The README opens with MDM's film: its picture, under the download buttons, plays it on
+  YouTube; and Trendshift's badge beside the star button
 - ✅ Download only a part of a video or a sound, from one time to another, cut quickly at the
   keyframes or exactly (encoded again), from the Download video window and the browser add-on's
   menu over a video ([#1662](https://github.com/anefzaoui/misterdownloadmanager/issues/1662))
@@ -681,6 +687,10 @@ These ship in the next version.
   another program...** takes any other 7-Zip command line program (a portable copy), checked
   before it is used
   ([#1525](https://github.com/anefzaoui/misterdownloadmanager/issues/1525))
+- ✅ Archives tested when their download completes (ZIP, 7z, RAR, split ones too, up to a size in
+  **Options → Archives**; right-click → **Test archive** for any): a damaged one says so and is
+  offered for Redownload, and a ZIP's damaged files are downloaded again from the same version of
+  the file ([#1661](https://github.com/anefzaoui/misterdownloadmanager/issues/1661))
 - ✅ The proxy reaches yt-dlp: Options' automatic configuration script is asked about the
   video's page for every yt-dlp run, "Use system settings" follows Windows' setup script (a
   proxy program's PAC mode), and a manual proxy chosen with no protocol ticked gets http and
