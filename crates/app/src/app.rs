@@ -4332,6 +4332,22 @@ impl App {
             && matches!(&item.state_here, Some((at, true)) if *at == item.dest);
         item.state_here = None;
         self.state_reads.forget(id);
+        // A name still to be numbered may be this row's own already (#1705), when no other row
+        // is at it: one running there, or whose name is settled (its file, its resume state).
+        let own_state = self
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .filter(|i| fresh && !i.name_from_url)
+            .filter(|i| {
+                let lower = |p: &std::path::Path| p.to_string_lossy().to_lowercase();
+                !self.items.iter().any(|o| {
+                    o.id != id
+                        && lower(&o.dest) == lower(&i.dest)
+                        && (o.live.is_some() || !o.number_at_start)
+                })
+            })
+            .map(|i| state_path(&i.dest));
         let Some(item) = self.item(id) else { return };
         let _guard = rt.enter();
         // A name nobody gave (the address's guess) is the server's to give: into the folder,
@@ -4351,7 +4367,13 @@ impl App {
         item.waits_for_address = false;
         let dl = if fresh {
             item.downloaded = 0;
-            Download::start_with(request, opts, kept)
+            match own_state {
+                // #1705: killed before the list was saved with the name its run took, it may
+                // be at this name already: the engine resumes its own state there, and numbers
+                // the name only past someone else's file.
+                Some(state) => Download::start_or_resume_own(state, request, opts, kept),
+                None => Download::start_with(request, opts, kept),
+            }
         } else {
             // Resume whenever there is something to resume, as the engine finds on its own task:
             // the window never waits for the disk (a folder on a network share that doesn't
@@ -8869,7 +8891,14 @@ impl App {
         let mut failed = Vec::new();
         let mut any_live = false;
         for i in &mut self.items {
-            if i.poll() {
+            let unnamed = i.number_at_start || i.name_from_url;
+            let ended = i.poll();
+            // #1705: the name its run took is saved with the list at once, not at the next
+            // half-minute's save: killed until then, the row would come back as never started.
+            if unnamed && !(i.number_at_start || i.name_from_url) {
+                self.dirty = true;
+            }
+            if ended {
                 self.dirty = true;
                 match i.status {
                     Status::Complete => {
@@ -16952,7 +16981,7 @@ mod fresh_address_tests {
     const SIZE: u64 = 2 << 20;
     const SEED: u64 = 7;
 
-    fn runtime() -> &'static tokio::runtime::Runtime {
+    pub(super) fn runtime() -> &'static tokio::runtime::Runtime {
         Box::leak(Box::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -16962,7 +16991,10 @@ mod fresh_address_tests {
         ))
     }
 
-    fn app_with(rt: &tokio::runtime::Runtime, items: Vec<Item>) -> std::mem::ManuallyDrop<App> {
+    pub(super) fn app_with(
+        rt: &tokio::runtime::Runtime,
+        items: Vec<Item>,
+    ) -> std::mem::ManuallyDrop<App> {
         let loaded = store::Loaded {
             next_id: 100,
             items,
@@ -16993,7 +17025,7 @@ mod fresh_address_tests {
             .as_millis() as u64
     }
 
-    fn get(app: &App, id: u64) -> &Item {
+    pub(super) fn get(app: &App, id: u64) -> &Item {
         app.items.iter().find(|i| i.id == id).unwrap()
     }
 
@@ -17075,7 +17107,7 @@ mod fresh_address_tests {
     }
 
     /// Bytes of `range` (`bytes=a-b`; none: the whole file) that `saved` says were on disk.
-    fn on_disk(range: Option<&str>, saved: &mdm_engine::state::ResumeState) -> u64 {
+    pub(super) fn on_disk(range: Option<&str>, saved: &mdm_engine::state::ResumeState) -> u64 {
         let (from, to) = match range.and_then(|r| r.strip_prefix("bytes=")?.split_once('-')) {
             Some((a, b)) => (
                 a.parse::<u64>().unwrap(),
@@ -17342,6 +17374,158 @@ mod fresh_address_tests {
             app.row(it, &none, 0).private.as_deref(),
             Some(model::PrivateMark::MemoryOnly.tip())
         );
+    }
+}
+
+/// #1705: MDM killed while a download ran (a crash, End task, a power cut), before its list was
+/// saved with the name the run took. The row comes back as the list held it at add, its name
+/// still to be numbered at start, with its part file and resume state under that very name.
+/// Resume continues it there; it used to start over as "name (1)" and leave the part behind.
+#[cfg(test)]
+mod killed_tests {
+    use super::fresh_address_tests::{app_with, get, on_disk, runtime};
+    use super::*;
+    use mdm_labserver::{Config, Faults, LabServer, content};
+
+    const SIZE: u64 = 4 << 20;
+    const SEED: u64 = 1705;
+
+    fn server(rt: &tokio::runtime::Runtime) -> (LabServer, url::Url) {
+        let s = rt
+            .block_on(LabServer::start(Config {
+                faults: Faults::parse("rate=4M").unwrap(),
+                ..Config::default()
+            }))
+            .unwrap();
+        let url = s.url(&format!("/gen/{SIZE}/data.bin?seed={SEED}"));
+        (s, url.parse().unwrap())
+    }
+
+    /// What a killed run of `url` leaves at `dest`: part of the file and its resume state.
+    fn cut_off(
+        rt: &tokio::runtime::Runtime,
+        s: &LabServer,
+        url: &url::Url,
+        dest: &std::path::Path,
+    ) -> mdm_engine::state::ResumeState {
+        let faults = s.faults();
+        s.set_faults(Faults {
+            stall_at: Some(1 << 20),
+            ..faults.clone()
+        });
+        let dl = {
+            let _in = rt.enter();
+            Download::start(
+                Request {
+                    url: url.clone(),
+                    headers: HeaderMap::new(),
+                    dest: Destination::File(dest.to_owned()),
+                },
+                Options {
+                    save_interval: Duration::from_millis(100),
+                    ..Options::default()
+                },
+            )
+        };
+        let end = Instant::now() + Duration::from_secs(20);
+        while dl.snapshot().downloaded < 256 << 10 {
+            assert!(Instant::now() < end, "the download never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        dl.cancel();
+        assert!(rt.block_on(dl.wait()).is_err());
+        s.set_faults(faults);
+        settled(rt, s);
+        let saved = mdm_engine::state::ResumeState::load(&state_path(dest)).unwrap();
+        assert!(saved.downloaded() > 0 && saved.downloaded() < SIZE);
+        saved
+    }
+
+    fn settled(rt: &tokio::runtime::Runtime, s: &LabServer) {
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), s.settled())
+                .await
+                .expect("the lab server settles")
+        });
+    }
+
+    /// The row as the list saved at add holds it: nothing downloaded, its name to be numbered.
+    fn as_added(id: u64, url: &url::Url, dest: &std::path::Path) -> Item {
+        let mut item = Item::new(id, url.clone(), dest.to_owned(), Category::General);
+        item.number_at_start = true;
+        item
+    }
+
+    fn finish(app: &mut App, id: u64) {
+        let ctx = egui::Context::default();
+        let end = Instant::now() + Duration::from_secs(30);
+        while get(app, id).status != Status::Complete {
+            let row = get(app, id);
+            assert!(
+                Instant::now() < end,
+                "it never finished: {:?} {:?}",
+                row.status,
+                row.error
+            );
+            app.poll(&ctx);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn resume_after_a_kill_continues_the_download_under_its_name() {
+        let rt = runtime();
+        let (s, url) = server(rt);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("data.bin");
+        let saved = cut_off(rt, &s, &url, &dest);
+        let mut app = app_with(rt, vec![as_added(1, &url, &dest)]);
+        s.clear_log();
+        app.start(1, false);
+        finish(&mut app, 1);
+        assert_eq!(get(&app, 1).dest, dest);
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["data.bin"], "one file, its part and state gone");
+        let data = std::fs::read(&dest).unwrap();
+        let mut want = vec![0; SIZE as usize];
+        content::fill(SEED, 0, &mut want);
+        assert!(data == want, "content mismatch");
+        // Continued: of what was on disk only each part's few bytes of check are asked again.
+        settled(rt, &s);
+        let log = s.log();
+        assert!(!log.is_empty());
+        let overlap = Options::default().verify_overlap;
+        for e in &log {
+            let again = on_disk(e.range.as_deref(), &saved);
+            assert!(again <= overlap, "asked again for {again}: {:?}", e.range);
+        }
+    }
+
+    /// The name is numbered as before when it is another row's: a second download of the same
+    /// address, added while the first one is stopped part-way at that name, never takes the
+    /// first one's part.
+    #[test]
+    fn a_name_that_is_another_rows_is_still_numbered() {
+        let rt = runtime();
+        let (s, url) = server(rt);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("data.bin");
+        let saved = cut_off(rt, &s, &url, &dest);
+        let mut first = Item::new(2, url.clone(), dest.clone(), Category::General);
+        first.downloaded = saved.downloaded();
+        first.size = Some(SIZE);
+        first.status = Status::Stopped;
+        let mut app = app_with(rt, vec![first, as_added(1, &url, &dest)]);
+        app.start(1, false);
+        finish(&mut app, 1);
+        assert_eq!(get(&app, 1).dest, dir.path().join("data (1).bin"));
+        assert_eq!(std::fs::metadata(&get(&app, 1).dest).unwrap().len(), SIZE);
+        let untouched = mdm_engine::state::ResumeState::load(&state_path(&dest)).unwrap();
+        assert_eq!(untouched, saved, "the first row's state is as it was");
     }
 }
 

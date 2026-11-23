@@ -577,6 +577,10 @@ These ship in the next version.
   the kept family switches it back. A 403 over both stands, no other error is asked again this
   way, never through a proxy; an adapter that can't reach the other family is named in the log.
   The lab server listens on both families (`--both-families`) with a `refuse_family` fault.
+- ✅ Resume after a crash or a kill continues the download instead of starting it over as
+  "name (1)" (#1705): a row whose name was still to be numbered at start resumes the resume
+  state at that name when it is its own (the same address, no other row at the name), looked at
+  on the download's task; the list is saved as soon as a run's file is named.
 - ✅ Website and help: what to do when an antivirus flags MDM (why it happens, how to check your
   copy against the release's checksums, where to report the false alarm), linked from the README
 - ✅ Website: the home page shows MDM's one-minute film under its first view; YouTube's player
