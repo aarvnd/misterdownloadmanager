@@ -141,6 +141,10 @@ pub struct Options {
     pub verify_overlap: u64,
     /// Fixed addresses for host names, like hosts-file entries (tests).
     pub hosts: Vec<(String, Vec<std::net::IpAddr>)>,
+    /// Hosts this download asks over one IP family only (IPv4 when true): they refused it with
+    /// 403 over the other one (#1660, a link signed for one family's address). The download's
+    /// own: every client it makes follows it, and no other download does. Set by the engine.
+    pub family: Vec<(String, bool)>,
     /// Options → Connection → DNS: who answers the names (#36).
     pub dns: crate::dns::DnsChoice,
     /// Options → Proxy / Socks → Network adapter (#35): the adapter every connection goes
@@ -289,6 +293,7 @@ impl Default for Options {
             speed_limit: None,
             verify_overlap: 64,
             hosts: Vec::new(),
+            family: Vec::new(),
             dns: Default::default(),
             route: Default::default(),
             unlocker: None,
@@ -961,9 +966,9 @@ pub struct KeptAnswer {
     unlocked: Option<crate::unlock::Unlocked>,
     /// What its client learnt of the server (#140): the download goes on with it.
     seen: Arc<crate::server::ServerSeen>,
-    /// The look's host refused it over one IP family and answered over the other (#1660): what
-    /// the download's log says of it.
-    family_said: Option<String>,
+    /// The look's host refused it over one IP family and answered over the other (#1660): the
+    /// download goes on over that one, and says so in its log.
+    family: Option<FamilySwitch>,
 }
 
 impl std::fmt::Debug for KeptAnswer {
@@ -1037,42 +1042,37 @@ pub async fn probe_kept(
     .await;
     // #1660: a 403 that may be this IP family's is asked once over the other one, as the
     // download's first request is (`FirstAsk::at`).
-    let mut family_said = None;
-    let (client, asked) = match asked {
-        Err(e) if agent_refused(&e) => {
-            let cancel = CancellationToken::new();
-            match get_over_other_family(
-                first_opts, &target, &headers, &as_get, &seen, expects, by, &cancel,
-            )
-            .await?
-            {
-                OtherFamilyAsk::Answered(answered) => {
-                    let (client, answer, said) = *answered;
-                    family_said = Some(said);
-                    (client, Ok(answer))
-                }
-                OtherFamilyAsk::No(_) => (client, Err(e)),
-            }
-        }
-        asked => (client, asked),
+    let look = Look {
+        url: &target,
+        headers: &headers,
+        as_get: &as_get,
+        seen: &seen,
+        expects,
     };
-    // A browser's User-Agent refused (#372): asked once more as MDM.
+    let mut family = None;
+    let (client, asked) = look
+        .over_other_family(first_opts, client, asked, by, &mut family)
+        .await?;
+    // A browser's User-Agent refused (#372): asked once more as MDM, and over the other family
+    // too when it is refused so again (a site that refuses both at once).
     let (client, asked) = match asked {
         Err(e) if agent_refused(&e) && first_opts.agent_fallback.is_some() => {
             let mut plain = opts.clone();
             plain.user_agent = opts.agent_fallback.clone().unwrap_or_default();
             let client = self::client(&plain, &target, &as_get, &seen)?;
-            let asked = get(
+            let (asked, by) = noting_refuser(get(
                 &client,
-                target,
-                headers,
+                target.clone(),
+                headers.clone(),
                 opts.post.as_ref(),
                 plain.site_agent(),
                 expects,
                 &CancellationToken::new(),
-            )
+            ))
             .await;
-            (client, asked)
+            let _ = e;
+            look.over_other_family(&plain, client, asked, by, &mut family)
+                .await?
         }
         asked => (client, asked),
     };
@@ -1089,8 +1089,8 @@ pub async fn probe_kept(
             }
             let cancel = CancellationToken::new();
             match browser_ask(opts, &asked_at, &asked_with, expects, &cancel).await {
-                Ok((b, (head, body, headers, took), said)) => {
-                    family_said = said;
+                Ok((b, (head, body, headers, took), switch)) => {
+                    family = switch;
                     (head, body, Some(b), headers, took)
                 }
                 Err(other @ (Error::Cancelled | Error::Adapter(_))) => return Err(other),
@@ -1168,7 +1168,7 @@ pub async fn probe_kept(
         url,
         client,
         seen,
-        family_said,
+        family,
         as_get,
         head,
         body,
@@ -2153,14 +2153,17 @@ fn client_with(
     Ok(builder
         // Each connection's opening timed (#140): the download's own, no extra probe.
         .connector_layer(crate::server::Timed(seen.clone()))
-        .dns_resolver(Arc::new(dns::Resolver::new(
-            &opts.hosts,
-            port,
-            &opts.dns,
-            &opts.extra_roots,
-            route,
-            Some(opts.connect_timeout),
-        )))
+        .dns_resolver(Arc::new(
+            dns::Resolver::new(
+                &opts.hosts,
+                port,
+                &opts.dns,
+                &opts.extra_roots,
+                route,
+                Some(opts.connect_timeout),
+            )
+            .kept_to(&opts.family),
+        ))
         .http1_only()
         .user_agent(&opts.user_agent)
         .connect_timeout(opts.connect_timeout)
@@ -2284,8 +2287,9 @@ async fn run_fresh(
                 "Connection 1: continuing from the answer the file's information window got",
             );
             let _ = shared.seen.set(k.seen);
-            if let Some(said) = k.family_said {
-                shared.event(said);
+            if let Some(switch) = k.family {
+                switch.keep(&mut opts);
+                shared.event(switch.said());
             }
             browser = k.browser;
             // The look got through under MDM's own name (#1422): so does the rest.
@@ -2385,7 +2389,11 @@ async fn run_fresh(
                         crate::agent::forget_own(&target);
                     }
                     match browser_first(&opts, &target, &asked, e, expects, shared, cancel).await {
-                        Ok((b, head, body, headers, ttfb)) => {
+                        Ok((b, head, body, headers, ttfb, switch)) => {
+                            // #1660: the rest of the download keeps to the family it took.
+                            if let Some(switch) = switch {
+                                switch.keep(&mut opts);
+                            }
                             browser = Some(b);
                             (as_get, client0, (head, body), headers, ttfb)
                         }
@@ -2552,7 +2560,7 @@ async fn run_fresh(
         saved.asked_as_mdm = asked_as_mdm;
         saved.asked_as_own = asked_own;
         saved.browser_like = browser.is_some();
-        saved.ipv4 = final_url.host_str().and_then(dns::kept_family);
+        saved.ipv4 = final_url.host_str().and_then(|h| opts.family_of(h));
         let ctx = Arc::new(Ctx {
             client: client0.clone(),
             validators: Mutex::new(validators),
@@ -2872,12 +2880,10 @@ async fn run_resume(
         );
         opts = speaking_own(&opts, own);
     }
-    // #1660: its host answered over one IP family only, in a session that may be over: asked
-    // over it again, unless this session learnt otherwise since.
-    if let (Some(v4), Some(host)) = (saved.ipv4, saved.final_url.host_str())
-        && dns::kept_family(host).is_none()
-    {
-        dns::keep_to_family(host, Some(v4));
+    // #1660: its host refused the link over one IP family and answered over the other: this
+    // run asks over that one too.
+    if let (Some(v4), Some(host)) = (saved.ipv4, saved.final_url.host_str()) {
+        opts.keep_family(host, v4);
         shared.event(format!(
             "Going on over {}: {host} refused the link over {}",
             family_name(v4),
@@ -3552,40 +3558,44 @@ fn family_name(v4: bool) -> &'static str {
     if v4 { "IPv4" } else { "IPv6" }
 }
 
-/// #1660: a host being asked over its other IP family, after it refused a request with a plain
-/// 403. Some file hosts sign a link for the address that loaded its page, and a browser that
-/// loaded it over IPv4 leaves a link MDM's IPv6 connection is refused with (or the other way
-/// round): a fresh link that looks expired.
+/// #1660: a host a download asks over its other IP family, after it refused a request with a
+/// plain 403. Some file hosts sign a link for the address that loaded its page, and a browser
+/// that loaded it over IPv4 leaves a link MDM's IPv6 connection is refused with (or the other
+/// way round): a fresh link that looks expired.
 ///
-/// From [`FamilySwitch::begin`] on, every client's resolver hands on the host's addresses of the
-/// other family only (`dns::keep_to_family`), so the one more request is made with a new
-/// client (no kept-alive socket of the refused family). It is made once, without the retries of
-/// a temporary failure. When it is answered the host stays so for the session (this download's
-/// other connections, the next downloads; the resume state keeps it for another session) and
-/// [`FamilySwitch::said`] goes to the log; otherwise [`FamilySwitch::undo`] puts back what was,
-/// and the 403 goes on as it did. A host kept to a family is switched the same way, so a later
-/// link signed for the other family downloads too: whichever family last worked is kept.
+/// The choice is the download's own (`Options::family`), never the process's: another download
+/// of the same host, running or to come, keeps the family its own link works over, and meets
+/// its own 403 if it has one. [`FamilySwitch::begin`] gives the options to ask once more with,
+/// through a new client (no kept-alive socket of the refused family), once, without the
+/// retries of a temporary failure. When that is answered, [`FamilySwitch::keep`] makes the
+/// download's options keep the host to that family (every client it makes from then on, its
+/// resume state for a later run) and [`FamilySwitch::said`] goes to its log; otherwise nothing
+/// was changed and the 403 goes on as it did.
+#[derive(Clone, Debug)]
 struct FamilySwitch {
     host: String,
     v4: bool,
-    before: Option<bool>,
 }
 
 impl FamilySwitch {
     /// Begun when the host has an address of the other family that the chosen adapter reaches
     /// and the refusal came from the host itself (never through a proxy, whose address the host
-    /// sees: `dns::other_family`). Otherwise what the log should say of it, if anything: an
-    /// adapter that can't reach the other family.
-    fn begin(opts: &Options, by: Option<Refuser>) -> Result<FamilySwitch, Option<String>> {
+    /// sees: `dns::other_family`): with `opts` kept to that family. Otherwise what the log
+    /// should say of it, if anything: an adapter that can't reach the other family.
+    fn begin(
+        opts: &Options,
+        by: Option<Refuser>,
+    ) -> Result<(FamilySwitch, Options), Option<String>> {
         let Some((host, by)) = by else {
             return Err(None);
         };
         let v4 = !by.is_ipv4();
         match dns::other_family(&host, by, &opts.route) {
             dns::OtherFamily::Has => {
-                let before = dns::kept_family(&host);
-                dns::keep_to_family(&host, Some(v4));
-                Ok(FamilySwitch { host, v4, before })
+                let switch = FamilySwitch { host, v4 };
+                let mut kept = opts.clone();
+                switch.keep(&mut kept);
+                Ok((switch, kept))
             }
             dns::OtherFamily::Unreachable(adapter) => Err(Some(format!(
                 "{host} refused over {}; its {} addresses can't be reached through {adapter}",
@@ -3596,6 +3606,10 @@ impl FamilySwitch {
         }
     }
 
+    fn keep(&self, opts: &mut Options) {
+        opts.keep_family(&self.host, self.v4);
+    }
+
     fn said(&self) -> String {
         format!(
             "{} refused over {}, downloading over {}",
@@ -3604,9 +3618,22 @@ impl FamilySwitch {
             family_name(self.v4)
         )
     }
+}
 
-    fn undo(self) {
-        dns::keep_to_family(&self.host, self.before);
+impl Options {
+    /// Keeps `host` to one IP family for this download (IPv4 when `v4`; `Options::family`).
+    fn keep_family(&mut self, host: &str, v4: bool) {
+        self.family.retain(|(h, _)| !h.eq_ignore_ascii_case(host));
+        self.family.push((host.to_ascii_lowercase(), v4));
+    }
+
+    /// The IP family this download keeps `host` to, if any (IPv4 when true).
+    fn family_of(&self, host: &str) -> Option<bool> {
+        let kept = self
+            .family
+            .iter()
+            .find(|(h, _)| h.eq_ignore_ascii_case(host));
+        kept.map(|(_, v4)| *v4)
     }
 }
 
@@ -3622,8 +3649,8 @@ async fn noting_refuser<T>(asking: impl Future<Output = T>) -> (T, Option<Refuse
 
 /// What asking over the other IP family came to ([`FamilySwitch`]).
 enum OtherFamilyAsk {
-    /// Answered: the client and answer to go on with, and what the log says.
-    Answered(Box<(Client, (Response, HeaderMap, Duration), String)>),
+    /// Answered: the client and answer to go on with, and the switch to keep.
+    Answered(Box<(Client, (Response, HeaderMap, Duration), FamilySwitch)>),
     /// Not asked, or not answered: the 403 stands. With what the log says of it, if anything.
     No(Option<String>),
 }
@@ -3641,14 +3668,14 @@ async fn get_over_other_family(
     by: Option<Refuser>,
     cancel: &CancellationToken,
 ) -> Result<OtherFamilyAsk, Error> {
-    let switch = match FamilySwitch::begin(opts, by) {
-        Ok(switch) => switch,
+    let (switch, kept) = match FamilySwitch::begin(opts, by) {
+        Ok(begun) => begun,
         Err(said) => return Ok(OtherFamilyAsk::No(said)),
     };
-    let again = match client(opts, url, as_get, seen) {
+    let again = match client(&kept, url, as_get, seen) {
         Ok(client) => {
             let (url, headers) = (url.clone(), headers.clone());
-            let (post, agent) = (opts.post.as_ref(), opts.site_agent());
+            let (post, agent) = (kept.post.as_ref(), kept.site_agent());
             cancellable(
                 cancel,
                 get(&client, url, headers, post, agent, expects, cancel),
@@ -3659,17 +3686,58 @@ async fn get_over_other_family(
         Err(e) => Err(e),
     };
     match again {
-        Ok((client, answer)) => Ok(OtherFamilyAsk::Answered(Box::new((
-            client,
-            answer,
-            switch.said(),
-        )))),
-        Err(e) => {
-            switch.undo();
-            match e {
-                Error::Cancelled | Error::Adapter(_) => Err(e),
-                _ => Ok(OtherFamilyAsk::No(None)),
+        Ok((client, answer)) => Ok(OtherFamilyAsk::Answered(Box::new((client, answer, switch)))),
+        Err(e @ (Error::Cancelled | Error::Adapter(_))) => Err(e),
+        Err(_) => Ok(OtherFamilyAsk::No(None)),
+    }
+}
+
+/// A look's request (`probe_kept`), for asking it over the other IP family.
+struct Look<'a> {
+    url: &'a Url,
+    headers: &'a HeaderMap,
+    as_get: &'a AsGet,
+    seen: &'a Arc<crate::server::ServerSeen>,
+    expects: bool,
+}
+
+impl Look<'_> {
+    /// `asked` (through `client`, with `opts`), or when it is a 403 the other family answers,
+    /// that answer with its client; the switch is noted in `family` for the download.
+    async fn over_other_family(
+        &self,
+        opts: &Options,
+        client: Client,
+        asked: Result<(Response, HeaderMap, Duration), Error>,
+        by: Option<Refuser>,
+        family: &mut Option<FamilySwitch>,
+    ) -> Result<(Client, Result<(Response, HeaderMap, Duration), Error>), Error> {
+        let Err(e) = asked else {
+            return Ok((client, asked));
+        };
+        if !agent_refused(&e) {
+            return Ok((client, Err(e)));
+        }
+        let cancel = CancellationToken::new();
+        let (url, headers, expects) = (self.url, self.headers, self.expects);
+        match get_over_other_family(
+            opts,
+            url,
+            headers,
+            self.as_get,
+            self.seen,
+            expects,
+            by,
+            &cancel,
+        )
+        .await?
+        {
+            OtherFamilyAsk::Answered(answered) => {
+                let (client, answer, switch) = *answered;
+                *family = Some(switch);
+                Ok((client, Ok(answer)))
             }
+            OtherFamilyAsk::No(_) => Ok((client, Err(e))),
         }
     }
 }
@@ -3707,31 +3775,9 @@ impl FirstAsk<'_> {
         .await;
         // #1660: a 403 may be the link's signature refusing this IP family; the other one is
         // asked first, since it changes nothing else about the download (its User-Agent stays).
-        let (client0, first) = match first {
-            Err(e) if agent_refused(&e) => {
-                let (as_get, seen) = (self.as_get, self.seen);
-                match get_over_other_family(opts, url, headers, as_get, seen, expects, by, cancel)
-                    .await?
-                {
-                    OtherFamilyAsk::Answered(answered) => {
-                        let (client, (resp, headers, took), said) = *answered;
-                        shared.event(said);
-                        // As `first_get` checks its answer (#1460).
-                        let sized =
-                            answer_size(resp.status(), resp.headers(), resp.content_length());
-                        let checked = sized.map_or(Ok(()), |s| not_the_file(opts.expected_size, s));
-                        (client, checked.map(|()| ((resp, headers), took)))
-                    }
-                    OtherFamilyAsk::No(said) => {
-                        if let Some(said) = said {
-                            shared.event(said);
-                        }
-                        (client0, Err(e))
-                    }
-                }
-            }
-            first => (client0, first),
-        };
+        let (client0, first) = self
+            .over_other_family(opts, url, headers, client0, first, by)
+            .await?;
         match first {
             Err(e) if agent_refused(&e) && opts.agent_fallback.is_some() => {
                 // #372: the rest of the download goes as MDM too.
@@ -3740,10 +3786,58 @@ impl FirstAsk<'_> {
                     "The server refused the browser's User-Agent; asking as Mister Download Manager",
                 );
                 let client1 = client(opts, url, self.as_get, self.seen)?;
-                let first = first_get(&client1, url, headers, opts, expects, shared, cancel).await;
+                let (first, by) = noting_refuser(first_get(
+                    &client1, url, headers, opts, expects, shared, cancel,
+                ))
+                .await;
+                // Refused so again: a site that refuses the browser's User-Agent and this
+                // family at once is asked as MDM over the other family too.
+                let (client1, first) = self
+                    .over_other_family(opts, url, headers, client1, first, by)
+                    .await?;
                 Ok((client1, first, true))
             }
             first => Ok((client0, first, false)),
+        }
+    }
+
+    /// `first` (asked through `client`), or when it is a plain 403 that the other IP family
+    /// answers (#1660, [`FamilySwitch`]), that answer with its client: `opts` then keeps the
+    /// host to that family, and the log says so.
+    async fn over_other_family(
+        &self,
+        opts: &mut Options,
+        url: &Url,
+        headers: &HeaderMap,
+        client: Client,
+        first: Result<((Response, HeaderMap), Duration), Error>,
+        by: Option<Refuser>,
+    ) -> Result<(Client, Result<((Response, HeaderMap), Duration), Error>), Error> {
+        let Err(e) = first else {
+            return Ok((client, first));
+        };
+        if !agent_refused(&e) {
+            return Ok((client, Err(e)));
+        }
+        let (as_get, seen, expects) = (self.as_get, self.seen, self.expects);
+        match get_over_other_family(opts, url, headers, as_get, seen, expects, by, self.cancel)
+            .await?
+        {
+            OtherFamilyAsk::Answered(answered) => {
+                let (client, (resp, headers, took), switch) = *answered;
+                switch.keep(opts);
+                self.shared.event(switch.said());
+                // As `first_get` checks its answer (#1460).
+                let sized = answer_size(resp.status(), resp.headers(), resp.content_length());
+                let checked = sized.map_or(Ok(()), |s| not_the_file(opts.expected_size, s));
+                Ok((client, checked.map(|()| ((resp, headers), took))))
+            }
+            OtherFamilyAsk::No(said) => {
+                if let Some(said) = said {
+                    self.shared.event(said);
+                }
+                Ok((client, Err(e)))
+            }
         }
     }
 
@@ -3838,6 +3932,7 @@ async fn browser_first(
         Body,
         HeaderMap,
         Duration,
+        Option<FamilySwitch>,
     ),
     Error,
 > {
@@ -3848,7 +3943,7 @@ async fn browser_first(
     shared.event(format!(
         "{host}: {refused}; asking once more the way a browser connects"
     ));
-    let (b, asked, said) = match browser_ask(opts, url, headers, expects, cancel).await {
+    let (b, asked, switch) = match browser_ask(opts, url, headers, expects, cancel).await {
         Ok(got) => got,
         Err(e @ (Error::Cancelled | Error::Adapter(_))) => return Err(e),
         Err(e) => {
@@ -3857,13 +3952,13 @@ async fn browser_first(
         }
     };
     let (head, body, headers, took) = asked;
-    if let Some(said) = said {
-        shared.event(said);
+    if let Some(switch) = &switch {
+        shared.event(switch.said());
     }
     shared.event(format!(
         "{host}: the browser-like connection got through; downloading on it"
     ));
-    Ok((b, head, body, headers, took))
+    Ok((b, head, body, headers, took, switch))
 }
 
 /// The browser-like connection for `url`, and its answer to the first request (`browser_first`,
@@ -3878,7 +3973,7 @@ async fn browser_ask(
     (
         Arc<crate::browserlike::Browser>,
         (Head, Body, HeaderMap, Duration),
-        Option<String>,
+        Option<FamilySwitch>,
     ),
     Error,
 > {
@@ -3891,32 +3986,24 @@ async fn browser_ask(
     let by = (head.status == StatusCode::FORBIDDEN && !is_bot_check(head.status, &head.headers))
         .then(|| Some((head.url.host_str()?.to_owned(), head.from?.ip())))
         .flatten();
-    let said = match FamilySwitch::begin(opts, by) {
-        Ok(switch) => {
-            drop(body);
-            let b = Arc::new(crate::browserlike::Browser::new(opts, url, headers)?);
-            let asked = std::time::Instant::now();
-            let again = match b.get(url.clone(), headers.clone(), false, cancel).await {
-                Ok((head, body, with)) => crate::browserlike::check_first(&head, expects)
-                    .map(|()| (head, body, with, asked.elapsed())),
-                Err(e) => Err(e),
-            };
-            match again {
-                Ok(answer) => return Ok((b, answer, Some(switch.said()))),
-                Err(e) => {
-                    switch.undo();
-                    if matches!(e, Error::Cancelled | Error::Adapter(_)) {
-                        return Err(e);
-                    }
-                    // The 403 stands, as `check_first` tells it.
-                    return Err(Error::Status(head.status));
-                }
-            }
-        }
-        Err(said) => said,
-    };
+    if let Ok((switch, kept)) = FamilySwitch::begin(opts, by) {
+        drop(body);
+        let b = Arc::new(crate::browserlike::Browser::new(&kept, url, headers)?);
+        let asked = std::time::Instant::now();
+        let again = match b.get(url.clone(), headers.clone(), false, cancel).await {
+            Ok((head, body, with)) => crate::browserlike::check_first(&head, expects)
+                .map(|()| (head, body, with, asked.elapsed())),
+            Err(e) => Err(e),
+        };
+        return match again {
+            Ok(answer) => Ok((b, answer, Some(switch))),
+            Err(e @ (Error::Cancelled | Error::Adapter(_))) => Err(e),
+            // The 403 stands, as `check_first` tells it.
+            Err(_) => Err(Error::Status(head.status)),
+        };
+    }
     crate::browserlike::check_first(&head, expects)?;
-    Ok((b, (head, body, with, took), said))
+    Ok((b, (head, body, with, took), None))
 }
 
 /// A plain `GET` (no Range), or a POST of `post`, that must answer 200 or 206. A GET follows

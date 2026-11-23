@@ -572,11 +572,12 @@ These ship in the next version.
 - ✅ A link signed for the page's IPv4 address no longer fails with 403 over IPv6 (#1660): a
   first request refused with 403 by a host that has addresses of both IP families is asked once
   (one request, no retries) over the other one: the download's, the file's information
-  window's look, and the browser-like connection's. When that works the log says so and the
-  host keeps that family for the session and in the download's resume state; a later 403 over
-  the kept family switches it back. A 403 over both stands, no other error is asked again this
-  way, never through a proxy; an adapter that can't reach the other family is named in the log.
-  The lab server listens on both families (`--both-families`) with a `refuse_family` fault.
+  window's look, and the browser-like connection's, after the User-Agent fallback too. When
+  that works the log says so and that download keeps the family, in its resume state as well;
+  the choice is the download's own, never another download's of the same host. A 403 over both
+  stands, no other error is asked again this way, never through a proxy; an adapter that can't
+  reach the other family is named in the log. The lab server listens on both families
+  (`--both-families`) with a `refuse_family` fault.
 - ✅ Tests: the browser add-on's real-browser tests no longer hang on a browser that stops
   answering: each command has a deadline, past which that browser is stopped and its test fails
   with the command's name; stopping a run (Ctrl+C) or an error in the test tool still cleans up

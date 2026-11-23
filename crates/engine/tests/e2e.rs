@@ -3412,25 +3412,21 @@ async fn get_at_host(
 }
 
 /// #1660: a link signed for the IPv4 address that loaded its page is refused with 403 over IPv6.
-/// It is asked once more over IPv4 and downloads so, the log says it, and the host's next
-/// download in the session goes over IPv4 from its first request.
+/// It is asked once more over IPv4 and downloads so, and the log says it. The choice is that
+/// download's: the host's next download starts as any does, and finds out for itself.
 #[tokio::test]
 async fn a_link_refused_over_ipv6_downloads_over_ipv4() {
     let s = on_both_families("rate=20M&refuse_family=6").await;
     let host = "signed-for-v4.mdm.test";
-    let (out, events, log) = get_at_host(&s, host, &["::1", "127.0.0.1"]).await;
-    assert_eq!(out.expect("downloads over IPv4").size, 2 << 20, "{log:?}");
-    assert!(log[0].peer.is_ipv6() && log[0].status == 403, "{log:?}");
-    assert!(log[1..].iter().all(|e| e.peer.is_ipv4()), "{log:?}");
-    assert_eq!(log.iter().filter(|e| e.status == 403).count(), 1, "{log:?}");
     let said = format!("{host} refused over IPv6, downloading over IPv4");
-    assert!(events.contains(&said), "{events:?}");
-
-    let (out, events, log) = get_at_host(&s, host, &["::1", "127.0.0.1"]).await;
-    assert_eq!(out.expect("downloads over IPv4").size, 2 << 20, "{log:?}");
-    assert!(log.iter().all(|e| e.peer.is_ipv4()), "{log:?}");
-    assert!(log.iter().all(|e| e.status != 403), "{log:?}");
-    assert!(!events.contains(&said), "{events:?}");
+    for _ in 0..2 {
+        let (out, events, log) = get_at_host(&s, host, &["::1", "127.0.0.1"]).await;
+        assert_eq!(out.expect("downloads over IPv4").size, 2 << 20, "{log:?}");
+        assert!(log[0].peer.is_ipv6() && log[0].status == 403, "{log:?}");
+        assert!(log[1..].iter().all(|e| e.peer.is_ipv4()), "{log:?}");
+        assert_eq!(log.iter().filter(|e| e.status == 403).count(), 1, "{log:?}");
+        assert!(events.contains(&said), "{events:?}");
+    }
 }
 
 /// #1660, the other way round: a link signed for an IPv6 address, refused over IPv4.
@@ -3506,27 +3502,100 @@ async fn the_other_family_is_asked_once_without_retries() {
     assert_eq!(log.len(), 1, "{log:?}");
     assert!(!events.iter().any(|e| e.contains("retrying")), "{events:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
-    assert_eq!(mdm_engine::dns::kept_family("half-down.mdm.test"), None);
 }
 
-/// #1660: a host kept to a family isn't kept to it for good. A later link signed for the other
-/// family is refused over the kept one, asked over the other, and that one is kept from then on.
+/// #1660: the family is the choice of the download that met the 403, never the host's for
+/// every download. While a download whose link works over IPv6 only runs, another one of the
+/// same host switches to IPv4: the first one's new connections (it loses its own again and
+/// again here) still go over IPv6, and none of them meets a 403.
 #[tokio::test]
-async fn a_host_kept_to_a_family_switches_back_for_a_link_signed_for_the_other() {
-    let s = on_both_families("rate=20M&refuse_family=6").await;
-    let (host, ips) = ("signed-in-turn.mdm.test", ["::1", "127.0.0.1"]);
-    let (out, _, log) = get_at_host(&s, host, &ips).await;
-    assert_eq!(out.expect("downloads over IPv4").size, 2 << 20, "{log:?}");
-    assert_eq!(mdm_engine::dns::kept_family(host), Some(true));
+async fn one_downloads_family_never_changes_another_download_of_the_host() {
+    let s = on_both_families("").await;
+    let (host, ips) = ("two-links.mdm.test", ["::1", "127.0.0.1"]);
+    let dir = tempfile::tempdir().unwrap();
+    let start = |path: &str| {
+        let (url, opts) = at_host(&s, host, &ips, path);
+        let req = Request {
+            url,
+            headers: Default::default(),
+            dest: Destination::Dir(dir.path().to_owned()),
+        };
+        Download::start(req, opts)
+    };
+    let over_v6 = start("/gen/4M/v6.bin?seed=1&refuse_family=4&rate=2M&drop_after=131072");
+    let deadline = std::time::Instant::now() + SETTLE;
+    while over_v6.snapshot().downloaded < 256 << 10 {
+        assert!(std::time::Instant::now() < deadline, "never started");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let over_v4 = start("/gen/1M/v4.bin?seed=2&refuse_family=6");
+    assert_eq!(over_v4.wait().await.expect("over IPv4").size, 1 << 20);
+    let still = over_v6.snapshot();
+    assert!(
+        still.downloaded < 4 << 20,
+        "the first one was still running"
+    );
+    assert_eq!(over_v6.wait().await.expect("over IPv6").size, 4 << 20);
+    tokio::time::timeout(SETTLE, s.settled())
+        .await
+        .expect("every request ends");
+    let log = s.log();
+    let of =
+        |name: &str| -> Vec<&LogEntry> { log.iter().filter(|e| e.path.contains(name)).collect() };
+    let (v6, v4) = (of("v6.bin"), of("v4.bin"));
+    assert!(v6.len() > 8, "it reconnected: {}", v6.len());
+    assert!(
+        v6.iter().all(|e| e.peer.is_ipv6() && e.status != 403),
+        "{v6:?}"
+    );
+    assert!(v4[0].peer.is_ipv6() && v4[0].status == 403, "{v4:?}");
+    assert!(
+        v4[1..].iter().all(|e| e.peer.is_ipv4() && e.status != 403),
+        "{v4:?}"
+    );
+}
 
-    s.set_faults(Faults::parse("rate=20M&refuse_family=4").unwrap());
-    let (out, events, log) = get_at_host(&s, host, &ips).await;
-    assert_eq!(out.expect("downloads over IPv6").size, 2 << 20, "{log:?}");
-    assert!(log[0].peer.is_ipv4() && log[0].status == 403, "{log:?}");
-    assert!(log[1..].iter().all(|e| e.peer.is_ipv6()), "{log:?}");
-    let said = format!("{host} refused over IPv4, downloading over IPv6");
+/// #1660 with #372: a site that refuses the browser's User-Agent and one IP family at once is
+/// asked as MDM over the other family too, and downloads.
+#[tokio::test]
+async fn a_refused_agent_and_a_refused_family_are_both_got_past() {
+    let s = on_both_families("rate=20M&refuse_agent=Chrome&refuse_family=6").await;
+    let host = "refuses-both.mdm.test";
+    let (url, opts) = at_host(&s, host, &["::1", "127.0.0.1"], "/gen/2M/a.bin?seed=1660");
+    let dir = tempfile::tempdir().unwrap();
+    let req = Request {
+        url,
+        headers: Default::default(),
+        dest: Destination::Dir(dir.path().to_owned()),
+    };
+    let opts = Options {
+        user_agent: "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/156.0".to_owned(),
+        automatic_agent: false,
+        agent_fallback: Some("MDM-test".to_owned()),
+        ..opts
+    };
+    let (out, events, log) = ended(Download::start(req, opts), &s).await;
+    assert_eq!(out.expect("downloads").size, 2 << 20, "{log:?}");
+    let refusals: Vec<(&str, bool)> = log
+        .iter()
+        .take_while(|e| e.status == 403)
+        .map(|e| (e.outcome.as_str(), e.peer.is_ipv6()))
+        .collect();
+    assert_eq!(
+        refusals,
+        [
+            ("fault:refuse_agent", true),
+            ("fault:refuse_agent", false),
+            ("fault:refuse_family", true),
+        ],
+        "{log:?}"
+    );
+    assert!(
+        log[3..].iter().all(|e| e.peer.is_ipv4() && e.status != 403),
+        "{log:?}"
+    );
+    let said = format!("{host} refused over IPv6, downloading over IPv4");
     assert!(events.contains(&said), "{events:?}");
-    assert_eq!(mdm_engine::dns::kept_family(host), Some(false));
 }
 
 /// #1660: the file's information window looks at the link first (`probe_kept`), and its look
@@ -3556,11 +3625,11 @@ async fn the_look_at_a_link_asks_the_other_family_and_the_download_says_so() {
     assert!(events.contains(&said), "{events:?}");
 }
 
-/// #1660: the family is saved with the download. Stopped and resumed in a session that knows
-/// nothing of the host (MDM was restarted), it goes on over the family that worked, where the
-/// other one would refuse it as an expired link.
+/// #1660: the family is saved with the download. Stopped and resumed (after a restart of MDM
+/// too), it goes on over the family that worked, where the other one would refuse it as an
+/// expired link.
 #[tokio::test]
-async fn a_resume_in_a_new_session_goes_on_over_the_family_that_worked() {
+async fn a_resume_goes_on_over_the_family_that_worked() {
     let s = on_both_families("rate=20M&refuse_family=6&stall_at=4194304").await;
     let host = "resumed.mdm.test";
     let (url, opts) = at_host(&s, host, &["::1", "127.0.0.1"], "/gen/8M/r.bin?seed=1660");
@@ -3594,8 +3663,7 @@ async fn a_resume_in_a_new_session_goes_on_over_the_family_that_worked() {
     let saved = mdm_engine::state::ResumeState::load(&state).unwrap();
     assert_eq!(saved.ipv4, Some(true));
 
-    // A new session: nothing is known of the host.
-    mdm_engine::dns::keep_to_family(host, None);
+    // Another run (MDM restarted, or not): it knows the family from the state alone.
     s.clear_log();
     let dl = Download::resume(state, Default::default(), opts).unwrap();
     let (out, events, log) = ended(dl, &s).await;
