@@ -3725,8 +3725,9 @@ async fn get(
     let mut party_hops = 0;
     // A site's form to post with the next request only (`PageSays::Form`: LuluStream's), and how
     // many times one was: a site that answers with its form again didn't take it this time
-    // (LuluStream's "Security error", about a post in three), and it is posted once more, up to
-    // `MAX_FORM_POSTS`; those posts don't count as a page's redirects.
+    // (LuluStream's "Security error", about a post in three), and it is posted once more after a
+    // pause (`form_repost_pause`), up to `MAX_FORM_POSTS`; those posts don't count as a page's
+    // redirects.
     let mut form: Option<Bytes> = None;
     let mut posts = 0;
     loop {
@@ -3840,9 +3841,11 @@ async fn get(
                         // The form again: posted once more, not a page's redirect.
                         hops -= 1;
                     }
+                    // A form's first post goes at once; a repost waits first, below.
+                    let pause = form_repost_pause(posts);
                     posts += 1;
                     form = Some(Bytes::from(body));
-                    (Duration::ZERO, action)
+                    (pause, action)
                 }
                 // Still the form after its last post: the site didn't take it this time, said in
                 // its name where it has one (`sites::form_refused`).
@@ -3900,8 +3903,22 @@ async fn get(
 const MAX_PAGE_REDIRECTS: usize = 5;
 /// Most times a site's form is posted in one look (`get`, `PageSays::Form`): a site that answers
 /// with the form again now and then (LuluStream's, about a post in three) gives the file within
-/// a few; one that never takes it is a web page after these.
+/// a few; one that never takes it is a web page after these. The first goes at once, each one
+/// after it once `form_repost_pause` has passed.
 const MAX_FORM_POSTS: usize = 5;
+/// The pause before a form's first repost, doubled before each one after it (0.5 s, 1 s, 2 s,
+/// 4 s): someone in a browser clicks again after a moment, and all five posts sent within 2.6 s
+/// were refused twice in a row where posts further apart may be taken (#1593).
+const FORM_REPOST_PAUSE: Duration = Duration::from_millis(500);
+
+/// How long to wait before posting a site's form when it was already posted `posts` times in
+/// this look: nothing before the first post, then `FORM_REPOST_PAUSE` doubling.
+fn form_repost_pause(posts: usize) -> Duration {
+    match posts {
+        0 => Duration::ZERO,
+        n => FORM_REPOST_PAUSE * 2u32.pow((n - 1).min(10) as u32),
+    }
+}
 /// How much of a web page is read to find its redirect.
 const PAGE_PEEK: usize = 256 << 10;
 /// The longest wait a page asks for before it leads on that is kept.
@@ -6196,6 +6213,17 @@ pub(crate) async fn cancellable<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A form's first post isn't held back; each repost waits twice as long as the one before,
+    /// and never longer than a page's own wait may be (#1593).
+    #[test]
+    fn a_forms_reposts_wait_longer_each_time() {
+        let pauses: Vec<u64> = (0..MAX_FORM_POSTS)
+            .map(|posts| form_repost_pause(posts).as_millis() as u64)
+            .collect();
+        assert_eq!(pauses, [0, 500, 1000, 2000, 4000]);
+        assert!(form_repost_pause(MAX_FORM_POSTS - 1) <= PAGE_WAIT);
+    }
 
     #[test]
     fn pages_lead_on_as_browsers_read_them() {
