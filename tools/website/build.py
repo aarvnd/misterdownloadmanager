@@ -1962,7 +1962,13 @@ def finish(available: dict[str, list[str]]) -> None:
     bust_caches()
     # One sitemap per language under an index, each page with its languages (sitei18n).
     sitei18n.sitemaps(OUT, SITE, PAGES, available, TODAY)
-    (OUT / "robots.txt").write_text(f"User-agent: *\nAllow: /\n\nSitemap: {SITE}/sitemap.xml\n", "utf-8")
+    # Content Signals (contentsignals.org, #1785): how automated systems may use the site, in
+    # the group it applies to. MDM is free software and its site is there to be found and
+    # understood: search, AI answers and AI training are all allowed.
+    signals = "Content-Signal: search=yes, ai-input=yes, ai-train=yes"
+    (OUT / "robots.txt").write_text(
+        f"User-agent: *\n{signals}\nAllow: /\n\nSitemap: {SITE}/sitemap.xml\n", "utf-8"
+    )
 
 
 def main() -> None:

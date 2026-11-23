@@ -569,6 +569,8 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ The website's robots.txt says how automated systems may use the site, with a Content
+  Signals line (contentsignals.org, #1785): search, AI answers and AI training are all allowed.
 - ✅ Tests: the browser add-on's real-browser tests no longer hang on a browser that stops
   answering: each command has a deadline, past which that browser is stopped and its test fails
   with the command's name; stopping a run (Ctrl+C) or an error in the test tool still cleans up
