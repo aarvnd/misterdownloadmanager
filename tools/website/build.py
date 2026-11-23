@@ -1899,6 +1899,8 @@ def build_llms() -> None:
     if (OUT / "automation-api.schema.json").is_file():
         lines.append(f"- [Automation API schema]({SITE}/automation-api.schema.json): JSON Schema of the local "
                      "channel other programs use to list, add and control downloads")
+    lines.append(f"- [MCP Server Card]({SITE}{SERVER_CARD}): what the local MCP server for AI assistants "
+                 "(misterdownloadmanager-mcp) is, its tools and how it is started")
     (OUT / "llms.txt").write_text("\n".join(lines) + "\n", "utf-8", newline="\n")
     full = [head_md, ""]
     for p, _, _, text in docs:
@@ -1958,11 +1960,78 @@ def bust_caches() -> None:
             page.write_text(new, "utf-8", newline="\n")
 
 
+# Where the MCP Server Card is served (#1789).
+SERVER_CARD = "/.well-known/mcp/server-card.json"
+
+
+def rust_str(literal: str) -> str:
+    """The text of a Rust string literal, given what is between its quotes: a backslash at a
+    line's end joins the next line without its indentation, and a backslash before a quote or
+    a backslash stands for that character."""
+    joined = re.sub(r"\\\n\s*", "", literal)
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t"}.get(m.group(1), m.group(1)), joined)
+
+
+def write_server_card() -> None:
+    """The MCP Server Card of misterdownloadmanager-mcp (#1789), so tools and agents can learn
+    what MDM's MCP server offers. Its fields are the Server Card draft's (SEP-2127, the schema in
+    modelcontextprotocol/ext-server-card). That draft describes servers reached over HTTP and
+    leaves out tools and anything installed on the user's computer, and MDM's server is only
+    that: a program beside the app that the assistant starts and talks to on stdin and stdout.
+    So the card has no `remotes` (nothing is hosted on this website, and it mustn't suggest so),
+    and what is particular to a local server is under `_meta`, the draft's place for it.
+
+    The server's name, its instructions and its tools are read from crates/mcp/src/lib.rs, so
+    the card never lists a tool the code doesn't register or misses one it does. The version is
+    the published one, which is what the server a visitor downloads answers with."""
+    src = (ROOT / "crates" / "mcp" / "src" / "lib.rs").read_text("utf-8")
+    quoted = r'"((?:[^"\\]|\\.)*)"'
+    tools = re.findall(r"(?s)#\[tool\(\s*description\s*=\s*" + quoted + r".*?\)\]\s*async fn (\w+)", src)
+    name = re.search(r'Implementation::new\(\s*"([^"]+)"', src)
+    instructions = re.search(r"(?s)const INSTRUCTIONS: &str = " + quoted + ";", src)
+    # Every #[tool(...)] must have been read: a card with a tool missing would be wrong.
+    if not tools or len(tools) != src.count("#[tool(") or not name or not instructions:
+        sys.exit("crates/mcp/src/lib.rs: the MCP server's name, instructions and tools couldn't be read "
+                 "(build.py write_server_card)")
+    setup = f"{SITE}/help/ai-assistants.html"
+    card = {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json",
+        "name": f"com.misterdownloadmanager/{name.group(1)}",
+        "version": VERSION,
+        "description": "Lists, adds, pauses, resumes and removes downloads in the Mister Download Manager "
+                       "on this computer.",
+        "title": NAME,
+        "websiteUrl": setup,
+        "repository": {"url": REPO, "source": "github", "subfolder": "crates/mcp"},
+        "icons": [{"src": f"{SITE}/assets/logo-640.png", "mimeType": "image/png", "sizes": ["640x640"]}],
+        "_meta": {
+            "com.misterdownloadmanager/local-server": {
+                "summary": "A local server, not a hosted one: this website runs no MCP endpoint. The program "
+                           "comes with Mister Download Manager and sits next to the app (the setup page "
+                           "lists where, on each system). The assistant starts it on the user's computer, "
+                           "with no arguments, and talks to it on stdin and stdout; it talks only to the "
+                           "Mister Download Manager running on that computer.",
+                "transport": {"type": "stdio", "command": "misterdownloadmanager-mcp", "args": []},
+                "setup": setup,
+                "serverInfo": {"name": name.group(1), "version": VERSION},
+                "instructions": rust_str(instructions.group(1)),
+                "tools": [{"name": fn, "description": rust_str(desc)} for desc, fn in tools],
+            },
+        },
+    }
+    out = OUT / SERVER_CARD.lstrip("/")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(card, indent=2, ensure_ascii=False) + "\n", "utf-8", newline="\n")
+
+
 def finish(available: dict[str, list[str]]) -> None:
     bust_caches()
     # One sitemap per language under an index, each page with its languages (sitei18n).
     sitei18n.sitemaps(OUT, SITE, PAGES, available, TODAY)
     (OUT / "robots.txt").write_text(f"User-agent: *\nAllow: /\n\nSitemap: {SITE}/sitemap.xml\n", "utf-8")
+    # In a folder whose name starts with a dot: GitHub Pages serves it because the site is
+    # uploaded as built (pages.yml) and has .nojekyll (copy_static).
+    write_server_card()
 
 
 def main() -> None:

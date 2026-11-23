@@ -569,6 +569,10 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ Website: an MCP Server Card at `/.well-known/mcp/server-card.json` (#1789): what MDM's MCP
+  server for AI assistants is, with its tools read from the server's own code at each build. It
+  says the server is local (a program beside the app, started by the assistant, talking only to
+  the MDM on that computer) and names no hosted address; it links to the help page that sets it up
 - ✅ Several Download File Info windows at once, one for each link, side by side: each opens a
   step from the one before and comes to the front, its title numbered from the second on; up to
   six, more links waiting their turn
