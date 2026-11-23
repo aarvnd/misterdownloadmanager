@@ -958,6 +958,16 @@ impl AddUrl {
         if !self.address.is_empty() {
             return;
         }
+        // A wrapped link (#1782) is shown as the address inside it, the one that will be
+        // downloaded.
+        let inner;
+        let clip = match crate::transfer::unwrapped(clip) {
+            crate::transfer::Wrapped::Address(address) => {
+                inner = address;
+                inner.as_str()
+            }
+            _ => clip,
+        };
         if let Ok(u) = Url::parse(clip)
             && (mdm_engine::supported(&u) || u.scheme() == "magnet")
         {
@@ -5266,6 +5276,21 @@ mod tests {
         assert_eq!(fill("magnet:?xt=urn:btih:ab"), "magnet:?xt=urn:btih:ab");
         assert_eq!(fill("some words"), "");
         assert_eq!(fill("mailto:a@b.example"), "");
+        // #1782: a wrapped link is shown as the address inside it; one with nothing MDM
+        // downloads inside is not taken.
+        assert_eq!(
+            fill("thunder://QUFodHRwOi8vZGwuZXhhbXBsZS5jb20vZmlsZXMvc2V0dXAuZXhlWlo="),
+            "http://dl.example.com/files/setup.exe"
+        );
+        assert_eq!(
+            fill("QQDL://ZnRwOi8vZnRwLmV4YW1wbGUuY29tL3B1Yi9kaXNrMS5pc28="),
+            "ftp://ftp.example.com/pub/disk1.iso"
+        );
+        assert_eq!(
+            fill("thunder://ZnRwOi8vZnRwLmV4YW1wbGUuY29tL3B1Yi9kaXNrMS5pc28="),
+            ""
+        );
+        assert_eq!(fill("flashget://not*base64"), "");
     }
 
     /// #511: an address with an Options → Sites Logins entry shows that login in "Use

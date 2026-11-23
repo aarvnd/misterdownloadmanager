@@ -569,6 +569,12 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ `thunder://`, `flashget://` and `qqdl://` links (#1782): the ordinary address wrapped in
+  each (base64) is unwrapped and downloaded, in **Add URL**, in a link copied to the clipboard and
+  wherever links are found in text (Add batch download from clipboard, Link grabber, an imported
+  list); kept under its real address, so a wrapped and a plain link to one file are one
+  download. Only http, https, ftp and magnet addresses are taken; anything else inside is not
+  supported. Registering MDM for these link types is not done yet.
 - ✅ Several Download File Info windows at once, one for each link, side by side: each opens a
   step from the one before and comes to the front, its title numbered from the second on; up to
   six, more links waiting their turn
