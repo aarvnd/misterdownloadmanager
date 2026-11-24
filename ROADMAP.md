@@ -573,6 +573,10 @@ These ship in the next version.
   the site answers its download form with the form again, MDM waits before sending it back (half
   a second, then one, two and four seconds) instead of sending its five tries within three
   seconds, which may be what the site refused
+- ✅ Website: the browser stores' ratings and users under their buttons on the home and download
+  pages, read again at every build; visitors rate MDM from one to five stars on the site (change
+  or remove their rating, keyboard and screen readers too), served by a small Cloudflare Worker
+  that keeps no IP address; only these ratings go into the structured data
 - ✅ Tests: the check that a finished file's damaged part is downloaded again no longer fails now
   and then (seen on a Linux runner): the test server damages only the first answer that carries
   those bytes, and the first download, on several connections, could split that answer off
