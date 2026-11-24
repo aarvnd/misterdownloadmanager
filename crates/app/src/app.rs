@@ -499,6 +499,8 @@ enum Cmd {
     AddToQueue(usize),
     RemoveFromQueue,
     ToggleCategories,
+    /// View → Preview pane, the toolbar's toggle, Alt+P (#1368).
+    TogglePreview,
     /// View → Dark Mode support.
     ToggleDarkMode,
     /// View → Always dark (#60).
@@ -1159,6 +1161,7 @@ impl Cmd {
             Cmd::Open => "Enter",
             Cmd::SelectAll => "Ctrl+A",
             Cmd::Properties => "Alt+Enter",
+            Cmd::TogglePreview if preview_key_free() => "Alt+P",
             Cmd::InterfaceSize(100) => "Ctrl+0",
             _ => return None,
         })
@@ -1271,16 +1274,35 @@ enum Pane {
     /// The menu bar (#1190): Tab from the list reaches it, and Tab again goes on to the toolbar
     /// (Shift+Tab back to the list), so a reader can walk the window's parts.
     Bar,
+    /// The preview pane (#1368), after the list while it shows: its keys scroll it.
+    Preview,
+}
+
+/// Alt+P shows and hides the preview pane, as in Explorer (#1368), where no menu bar title of
+/// the interface language has P for its access key (Polish's Plik, Croatian's Preuzimanja...):
+/// there Alt+P opens that menu, as Windows' own menus answer it.
+fn preview_key_free() -> bool {
+    !crate::chrome::menubar_letters().iter().any(|l| l == "p")
 }
 
 /// Where Tab (Shift+Tab: `back`) takes the keys from `from` (`None`: nothing had them, after a
-/// click on the toolbar or the strip), round; the tree left out while it is hidden.
-fn tab_to(from: Option<Pane>, tree_shown: bool, back: bool) -> Pane {
-    let order: &[Pane] = if tree_shown {
-        &[Pane::Toolbar, Pane::Tree, Pane::List, Pane::Bar]
-    } else {
-        &[Pane::Toolbar, Pane::List, Pane::Bar]
-    };
+/// click on the toolbar or the strip), round; the tree and the preview pane left out while they
+/// are hidden.
+fn tab_to(from: Option<Pane>, tree_shown: bool, preview_shown: bool, back: bool) -> Pane {
+    let order: Vec<Pane> = [
+        Pane::Toolbar,
+        Pane::Tree,
+        Pane::List,
+        Pane::Preview,
+        Pane::Bar,
+    ]
+    .into_iter()
+    .filter(|p| match p {
+        Pane::Tree => tree_shown,
+        Pane::Preview => preview_shown,
+        _ => true,
+    })
+    .collect();
     let n = order.len();
     let at = from.and_then(|p| order.iter().position(|q| *q == p));
     order[match (at, back) {
@@ -1329,6 +1351,9 @@ pub struct App {
     move_many_for: Vec<u64>,
     /// The Categories tree has the keys (else the list or the toolbar; Tab moves between them).
     tree_keys: bool,
+    /// The preview pane has the keys (#1368), and its own state (where it is scrolled to).
+    preview_keys: bool,
+    preview: crate::preview::Pane,
     /// The toolbar has the keys (Tab reaches it, #1190), at button `toolbar_at` (kept when Tab
     /// leaves it, as Windows' toolbars keep theirs).
     toolbar_keys: bool,
@@ -1401,6 +1426,16 @@ pub struct App {
     /// Download complete snoozed (#741), and how many finished meanwhile (the tray icon's tip).
     snooze: crate::finish::Snooze,
     snoozed_finished: u64,
+    /// The windows that wait while a full-screen app, a presentation or the locked screen is on
+    /// (#1773, hold.rs).
+    hold: crate::hold::Hold,
+    /// Links copied to the clipboard meanwhile (#1773): each with its number, offered (its
+    /// Download File Info) in turn once the user is back.
+    copied_waiting: std::collections::VecDeque<(u64, String)>,
+    copied_serial: u64,
+    /// The Updates window open is the automatic check's (it waits during a full-screen app,
+    /// #1773), not one asked for from the Help menu.
+    updates_auto: bool,
     settings: Settings,
     speed_settings: Option<dialogs::SpeedSettings>,
     scheduler: Option<crate::scheduler::Scheduler>,
@@ -2197,6 +2232,8 @@ impl App {
             a11y_lang: "",
             ui_ctx: ctx.clone(),
             tree_keys: false,
+            preview_keys: false,
+            preview: Default::default(),
             toolbar_keys: false,
             bar_keys: false,
             menubar_at: 0,
@@ -2230,6 +2267,10 @@ impl App {
             summaries: Vec::new(),
             snooze: crate::finish::Snooze::from_saved(settings.complete_snoozed_until, unix_now()),
             snoozed_finished: 0,
+            hold: crate::hold::Hold::new(settings.hold_popups),
+            copied_waiting: Default::default(),
+            copied_serial: 0,
+            updates_auto: false,
             settings,
             speed_settings: None,
             scheduler: None,
@@ -3490,6 +3531,31 @@ impl App {
                     if window == "category-remove" {
                         self.confirm_category_delete =
                             self.confirm_category_delete.take().map(|d| d.removing());
+                    }
+                }
+            }
+            // The preview pane shown (#1368's checks and screenshots), `preview:off` hidden.
+            "preview" => {
+                let on = tab != "off";
+                if self.settings.preview_pane != on {
+                    self.run(Cmd::TogglePreview, None, ctx);
+                }
+            }
+            // The list's selection (checks of what depends on it, screenshots): `select:3` the
+            // third download shown, `select:all`, `select:none`.
+            "select" => {
+                let shown = self.shown_ids();
+                match tab {
+                    "all" => self.run(Cmd::SelectAll, None, ctx),
+                    "none" => self.selection.retain(&Vec::new()),
+                    n => {
+                        if let Some(id) = n
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| shown.get(n.checked_sub(1)?).copied())
+                        {
+                            self.selection.set(id);
+                        }
                     }
                 }
             }
@@ -5168,6 +5234,18 @@ impl App {
                 tip.push('\n');
                 tip.push_str(&dialogs::finished_count(self.snoozed_finished));
             }
+            // Windows waiting for the user to be back from a full-screen app (#1773).
+            let waiting = self.hold.waiting();
+            if waiting > 0 {
+                tip.push('\n');
+                // i18n: the tip of MDM's notification area (tray) icon: {n} windows of MDM (Download complete...) wait while a full-screen game, app or presentation is on, and show when the user is back
+                let line = crate::i18n::tn(
+                    waiting as u64,
+                    "{n} window waits until you're back",
+                    "{n} windows wait until you're back",
+                );
+                tip.push_str(&line);
+            }
             t.set_tooltip(&tip);
             // "Downloads in progress": each running download, to show its progress window (#63).
             let running: Vec<(u64, String)> = self
@@ -5409,6 +5487,14 @@ impl App {
         if mdm_engine::supported(&url) && self.settings.clipboard_type(&name) {
             // Where a Download File Info came from, without the address (#1157).
             tracing::info!("clipboard: a newly copied link, offered for download");
+            // Its Download File Info waits during a full-screen app, as every window that comes
+            // up by itself does (#1773), behind those already waiting.
+            if self.hold.busy().is_some() || self.hold.waiting() > 0 {
+                tracing::info!("clipboard: the link waits until the user is back");
+                self.copied_serial += 1;
+                self.copied_waiting.push_back((self.copied_serial, text));
+                return;
+            }
             let cmd = ipc::Command {
                 url: Some(text),
                 ..Default::default()
@@ -8718,6 +8804,14 @@ impl App {
                 self.dirty = true;
             }
             Cmd::ToggleCategories => self.show_categories = !self.show_categories,
+            Cmd::TogglePreview => {
+                self.settings.preview_pane = !self.settings.preview_pane;
+                // Hidden with the keys: they go back to the list.
+                if !self.settings.preview_pane && self.preview_keys {
+                    self.give_keys(Pane::List);
+                }
+                self.dirty = true;
+            }
             Cmd::ChooseLanguage => {
                 if self.lang_picker.is_none() {
                     self.lang_picker = Some(crate::langpick::Picker::new(
@@ -8927,6 +9021,8 @@ impl App {
                 if self.updates.is_none() {
                     self.updates = Some(crate::help::Updates::check(&self.rt, ctx));
                 }
+                // The automatic check's, waiting (#1773): asked for now, it shows at once.
+                self.updates_auto = false;
             }
             Cmd::About => self.about = Some(crate::help::About),
             Cmd::Support => crate::help::support(),
@@ -9823,6 +9919,19 @@ impl App {
                     true,
                     false,
                 ),
+                // MDM's (#1368): the selected download's picture and details beside the list.
+                I(
+                    if self.settings.preview_pane {
+                        // i18n: View menu: hides the pane beside the download list that shows the selected download's picture and details
+                        crate::i18n::mark("Hide &preview pane")
+                    } else {
+                        // i18n: View menu: shows a pane beside the download list with the selected download's picture and details
+                        crate::i18n::mark("Show &preview pane")
+                    },
+                    Cmd::TogglePreview,
+                    true,
+                    false,
+                ),
                 self.arrange_menu(),
                 // i18n: noun: the toolbar (submenu of View with its settings)
                 Sub("Toolbar", false, vec![]),
@@ -10716,10 +10825,98 @@ impl App {
     }
 
     /// Gives `pane` the main window's keys, and takes them from the other two (#1190).
+    /// The preview pane (#1368) at the list's trailing side, from English `list_left` on: its
+    /// splitter, its frame and what it shows of the selection. `free`: nothing else (a menu, a
+    /// text box) has the keys. Returns where the list ends (English, from the window's left).
+    fn preview_pane(
+        &mut self,
+        ui: &mut Ui,
+        o: Pos2,
+        w: f32,
+        h: f32,
+        list_left: f32,
+        free: bool,
+    ) -> f32 {
+        use crate::preview::{self, Shows, Summary};
+        let ctx = ui.ctx().clone();
+        let top = o.y + chrome::MENU_H + chrome::pane_top();
+        let bottom = o.y + h - STRIP_H - 5.0;
+        let right = o.x + w - 7.0;
+        // As wide as it was left, the list keeping room of its own (a narrow window: the pane
+        // gives way first, never more than 60 % of the room).
+        let room = w - 7.0 - list_left - 4.0;
+        let max_w = (room - preview::LIST_KEEPS).max(preview::MIN_WIDTH);
+        let pane_w = (self.settings.preview_width as f32)
+            .clamp(preview::MIN_WIDTH, max_w)
+            .min((room * 0.6).floor());
+        let left = right - pane_w;
+        // The splitter: the 4 px gap between the list and the pane, dragged sideways.
+        let split = winui::rect(egui::Rect::from_min_max(
+            pos2(left - 4.0, top),
+            pos2(left, bottom),
+        ));
+        let sr = ui.interact(
+            split,
+            egui::Id::unique("preview-splitter"),
+            winui::pointer_drag(),
+        );
+        if sr.hovered() || sr.dragged() {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if sr.dragged()
+            && let Some(p) = sr.interact_pointer_pos()
+        {
+            // The pointer stays on the splitter's middle (the pane's width from the window's
+            // trailing edge: the left in RTL).
+            let nw = (right - winui::mx(p.x) - 2.0)
+                .round()
+                .clamp(preview::MIN_WIDTH, max_w);
+            self.settings.preview_width = nw as u32;
+        }
+        if sr.drag_stopped() {
+            self.dirty = true;
+        }
+        // A press in the pane gives it the keys, as the tree takes them by a click.
+        let pane_rc = winui::rect(egui::Rect::from_min_max(
+            pos2(left, top),
+            pos2(right, bottom),
+        ));
+        if ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer
+                    .press_origin()
+                    .is_some_and(|at| pane_rc.contains(at))
+        }) {
+            self.give_keys(Pane::Preview);
+        }
+        let picked: Vec<&Item> = self
+            .selection
+            .ids()
+            .iter()
+            .filter_map(|id| self.items.iter().find(|i| i.id == *id))
+            .collect();
+        let shows = match picked.as_slice() {
+            [] => Shows::Nothing,
+            [one] => Shows::One(one),
+            many => Shows::Many(Summary::of(many.iter().copied())),
+        };
+        let keys = self.preview_keys && free;
+        let event = self
+            .preview
+            .show(ui, left, right, top, bottom, &shows, keys);
+        match event {
+            Some(preview::Event::Close) => self.run(Cmd::TogglePreview, None, &ctx),
+            Some(preview::Event::Keys) => self.give_keys(Pane::Preview),
+            None => {}
+        }
+        left - 4.0 - o.x
+    }
+
     fn give_keys(&mut self, pane: Pane) {
         self.toolbar_keys = pane == Pane::Toolbar;
         self.tree_keys = pane == Pane::Tree;
         self.bar_keys = pane == Pane::Bar;
+        self.preview_keys = pane == Pane::Preview;
         self.list.set_keys(pane == Pane::List);
     }
 
@@ -10832,6 +11029,10 @@ impl App {
         // A style theme's title bar, drawn above the layout (Windows; #45), mirrored right to
         // left as the progress window's.
         let full = self.drawn_caption(ui, full);
+        // Whether the keys are in use, read before the panes take theirs (Tab, the arrows, End):
+        // read only after them, the press that moved the keys was gone and no focus ring showed
+        // (the toolbar's, the tree's, the preview pane's, #1368).
+        winui::keyboard_in_use(&ctx);
         let o = full.min;
         let (w, h) = (full.width(), full.height());
         let mut chosen: Option<(Cmd, Option<u64>)> = None;
@@ -11072,6 +11273,8 @@ impl App {
                     Some(Pane::Toolbar)
                 } else if self.tree_keys && self.show_categories {
                     Some(Pane::Tree)
+                } else if self.preview_keys && self.settings.preview_pane {
+                    Some(Pane::Preview)
                 } else if self.list.has_keys() {
                     Some(Pane::List)
                 } else if self.bar_keys {
@@ -11079,7 +11282,7 @@ impl App {
                 } else {
                     None
                 };
-                let pane = tab_to(from, self.show_categories, back);
+                let pane = tab_to(from, self.show_categories, self.settings.preview_pane, back);
                 self.give_keys(pane);
                 crate::chrome::show_cues(&ctx);
             }
@@ -11128,7 +11331,16 @@ impl App {
         ];
         let tb: Vec<(Icon, &str, bool)> = buttons.iter().map(|(i, l, e, _)| (*i, *l, *e)).collect();
         let tb_keys = (self.toolbar_keys && free).then_some(self.toolbar_at);
-        match chrome::toolbar(ui, o, w, &tb, tb_keys) {
+        // The preview pane's toggle at the band's end (#1368), its picture on the pane's side.
+        // i18n: toolbar toggle button: shows or hides the preview pane (the selected download's picture and details)
+        let mut toggle = (Icon::PreviewPane, "Preview", self.settings.preview_pane);
+        if winui::rtl() {
+            toggle.0 = Icon::PreviewPaneLeft;
+        }
+        match chrome::toolbar(ui, o, w, &tb, Some(toggle), tb_keys) {
+            Some(ToolbarEvent::Click(k)) if k == buttons.len() => {
+                chosen = Some((Cmd::TogglePreview, None));
+            }
             Some(ToolbarEvent::Click(k)) => chosen = Some((buttons[k].3, None)),
             Some(ToolbarEvent::Drop(k, at)) => {
                 let kind = match buttons[k].0 {
@@ -11263,9 +11475,16 @@ impl App {
         let (ids, rows) = self.list_rows();
         self.selection.retain(&ids);
         let (selected, focus) = self.selection.rows(&ids);
+        // The preview pane (#1368): at the list's trailing side (the left in RTL), as wide as
+        // its splitter leaves it, the list keeping room of its own.
+        let list_right = if self.settings.preview_pane {
+            self.preview_pane(ui, o, w, h, list_left, free)
+        } else {
+            w - 7.0
+        };
         let outer = egui::Rect::from_min_max(
             pos2(o.x + list_left, o.y + chrome::MENU_H + chrome::pane_top()),
-            pos2(o.x + w - 7.0, o.y + h - STRIP_H - 4.0),
+            pos2(o.x + list_right, o.y + h - STRIP_H - 4.0),
         );
         self.list.menu_open = self.popup.is_some() || self.open_menu.is_some();
         // Another node shows from its top (its rows aren't the last one's).
@@ -11294,6 +11513,7 @@ impl App {
         if self.list.has_keys() {
             self.tree_keys = false;
             self.toolbar_keys = false;
+            self.preview_keys = false;
         }
         if let Some(pick) = r.pick {
             self.selection.apply(pick, &ids);
@@ -11403,6 +11623,12 @@ impl App {
                     || i.consume_key(egui::Modifiers::NONE, egui::Key::F2)
             }) {
                 chosen = Some((Cmd::MoveRename, None));
+            }
+            // Alt+P: the preview pane, as Explorer's (#1368), unless a menu bar title takes P.
+            if preview_key_free()
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::P))
+            {
+                chosen = Some((Cmd::TogglePreview, None));
             }
             if find {
                 chosen = Some((Cmd::Find, None));
@@ -12690,7 +12916,10 @@ impl App {
             self.auto_update = Some(crate::help::check(&self.rt, ctx));
         }
         if self.updates.is_some() {
-            if self.raise_updates && crate::dialogs::focus_when_shown(ctx, "updates") {
+            if self.raise_updates
+                && !self.hold.is_waiting(&crate::hold::PopUp::Update)
+                && crate::dialogs::focus_when_shown(ctx, "updates")
+            {
                 self.raise_updates = false;
             }
         } else {
@@ -12717,6 +12946,7 @@ impl App {
                 tracing::info!("update available: {}", rel.version);
                 self.updates = Some(crate::help::Updates::found(rel));
                 self.raise_updates = true;
+                self.updates_auto = true;
             }
         }
     }
@@ -12777,7 +13007,13 @@ impl App {
                 self.extension = Some(crate::extension::Extension::new());
             }
         }
-        if let Some(d) = &mut self.extension {
+        // It offers itself at start: it waits during a full-screen app (#1773).
+        if self.extension.is_some()
+            && self
+                .hold
+                .lets(crate::hold::PopUp::Extension, Instant::now())
+            && let Some(d) = &mut self.extension
+        {
             match d.show(ctx) {
                 Outcome::Open => {}
                 Outcome::Done(()) => {
@@ -12795,7 +13031,12 @@ impl App {
         }
         let mut weekly = self.settings.update_check;
         let mut close_for_update = false;
-        if let Some(d) = &mut self.updates {
+        // The automatic check's new version waits during a full-screen app (#1773); the one asked
+        // for from the Help menu shows at once.
+        if self.updates.is_some()
+            && (!self.updates_auto || self.hold.lets(crate::hold::PopUp::Update, Instant::now()))
+            && let Some(d) = &mut self.updates
+        {
             match d.show(ctx, &self.rt, &mut weekly) {
                 Outcome::Open => {}
                 // Update now: the new copy is going in place; MDM saves and closes for it.
@@ -12826,7 +13067,31 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        // The windows that come up by themselves wait while a full-screen app, a presentation or
+        // the locked screen is on (#1773): the system asked, each such window below asks whether
+        // it may show, and those no longer asked for leave the line at the end.
+        let now = Instant::now();
+        self.hold.on = self.settings.hold_popups;
+        self.hold.begin(now, crate::hold::system);
         self.help_dialogs(ctx);
+        // Links copied to the clipboard meanwhile, offered in turn once the user is back.
+        let ready: Vec<u64> = self
+            .copied_waiting
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| self.hold.lets(crate::hold::PopUp::CopiedLink(*n), now))
+            .collect();
+        for n in ready {
+            if let Some(at) = self.copied_waiting.iter().position(|(m, _)| *m == n)
+                && let Some((_, text)) = self.copied_waiting.remove(at)
+            {
+                let cmd = ipc::Command {
+                    url: Some(text),
+                    ..Default::default()
+                };
+                self.handle_command(cmd, ctx);
+            }
+        }
         // The next question in turn; one about a download that has left the list meanwhile is
         // checked afresh instead (it may ask again, about another).
         while self.duplicate.is_none()
@@ -12899,13 +13164,20 @@ impl App {
                 self.show_import(links, "Click'n'Load".into());
             }
         }
-        if let Some(d) = &mut self.extracts.needs_7zip
+        // These four follow a finished download by themselves: they wait during a full-screen
+        // app (#1773).
+        if self.extracts.needs_7zip.is_some()
+            && self.hold.lets(crate::hold::PopUp::SevenZip, now)
+            && let Some(d) = &mut self.extracts.needs_7zip
             && !matches!(d.show(ctx), Outcome::Open)
         {
             self.extracts.needs_7zip = None;
         }
         // A damaged archive (#1661): Redownload downloads it (every volume) again.
-        if let Some(d) = &mut self.tests.damaged {
+        if self.tests.damaged.is_some()
+            && self.hold.lets(crate::hold::PopUp::ArchiveDamaged, now)
+            && let Some(d) = &mut self.tests.damaged
+        {
             match d.show(ctx) {
                 Outcome::Open => {}
                 Outcome::Closed | Outcome::Done(false) => self.tests.damaged = None,
@@ -12919,12 +13191,17 @@ impl App {
             }
         }
         // Test archive's outcome, when it found no damage (one at a time).
-        if self.notice.is_none()
+        if self.tests.told.is_some()
+            && self.hold.lets(crate::hold::PopUp::ArchiveTested, now)
+            && self.notice.is_none()
             && let Some(text) = self.tests.told.take()
         {
             self.notice = Some((crate::i18n::mark("Test archive"), text));
         }
-        if let Some(d) = &mut self.extracts.ask {
+        if self.extracts.ask.is_some()
+            && self.hold.lets(crate::hold::PopUp::ArchivePassword, now)
+            && let Some(d) = &mut self.extracts.ask
+        {
             match d.show(ctx) {
                 Outcome::Open => {}
                 Outcome::Closed => self.extracts.answer(None),
@@ -13071,7 +13348,12 @@ impl App {
                 }
             }
         }
-        if let Some(n) = &mut self.limit_notice
+        // The download limit's warning comes by itself: it waits during a full-screen app
+        // (#1773). Not the Turn off countdown below: the computer turns off at its end, and its
+        // Cancel must stay within reach.
+        if self.limit_notice.is_some()
+            && self.hold.lets(crate::hold::PopUp::LimitReached, now)
+            && let Some(n) = &mut self.limit_notice
             && !matches!(n.show(ctx), Outcome::Open)
         {
             self.limit_notice = None;
@@ -13714,8 +13996,14 @@ impl App {
                 }
             }
         }
+        // Download complete and Downloads complete wait during a full-screen app (#1773), and
+        // show when the user is back, in the order they came.
         let mut keep = Vec::new();
         for mut c in std::mem::take(&mut self.complete) {
+            if !self.hold.lets(crate::hold::PopUp::Complete(c.id), now) {
+                keep.push(c);
+                continue;
+            }
             match c.show(ctx) {
                 Outcome::Open => keep.push(c),
                 Outcome::Done(()) | Outcome::Closed => {
@@ -13733,6 +14021,10 @@ impl App {
         // Groups' summaries (#766).
         let mut keep = Vec::new();
         for mut g in std::mem::take(&mut self.summaries) {
+            if !self.hold.lets(crate::hold::PopUp::Summary(g.group), now) {
+                keep.push(g);
+                continue;
+            }
             let outcome = g.show(ctx);
             if matches!(outcome, Outcome::Open) {
                 keep.push(g);
@@ -13750,6 +14042,7 @@ impl App {
             }
         }
         self.summaries = keep;
+        self.hold.end();
     }
 }
 
@@ -13986,6 +14279,16 @@ impl App {
             // UI, which egui runs then only when asked: every 2 s, as the clock repaints.
             if ctx.input(|i| i.viewport().minimized == Some(true)) {
                 ctx.request_ui_pass(egui::ViewportId::ROOT);
+            }
+        }
+        // Windows waiting for the user (#1773): the system is asked again, and once back they
+        // show one by one, by passes of the main window's UI (asked for: a minimized or hidden
+        // window runs none by itself).
+        if let Some(after) = self.hold.next_pass(Instant::now()) {
+            if after.is_zero() {
+                ctx.request_ui_pass(egui::ViewportId::ROOT);
+            } else {
+                ctx.request_repaint_after(after);
             }
         }
         ctx.request_repaint_after(Duration::from_secs(2));
@@ -16501,7 +16804,7 @@ mod pane_tests {
             let mut at = from;
             let mut seen = Vec::new();
             for _ in 0..4 {
-                let to = tab_to(at, shown, back);
+                let to = tab_to(at, shown, false, back);
                 seen.push(to);
                 at = Some(to);
             }
@@ -16511,15 +16814,27 @@ mod pane_tests {
         assert_eq!(round(Some(List), true, true), [Tree, Toolbar, Bar, List]);
         assert_eq!(round(Some(List), false, false), [Bar, Toolbar, List, Bar]);
         // The tree had the keys as it was hidden: on to the toolbar.
-        assert_eq!(tab_to(Some(Tree), false, false), Toolbar);
-        assert_eq!(tab_to(None, true, false), Toolbar);
-        assert_eq!(tab_to(None, true, true), Bar);
+        assert_eq!(tab_to(Some(Tree), false, false, false), Toolbar);
+        assert_eq!(tab_to(None, true, false, false), Toolbar);
+        assert_eq!(tab_to(None, true, false, true), Bar);
         // The bar is one step from the list either way: Tab from the list reaches the menus, and
         // Shift+Tab from the toolbar comes back to them.
-        assert_eq!(tab_to(Some(List), true, false), Bar);
-        assert_eq!(tab_to(Some(Toolbar), true, true), Bar);
-        assert_eq!(tab_to(Some(Bar), true, false), Toolbar);
-        assert_eq!(tab_to(Some(Bar), true, true), List);
+        assert_eq!(tab_to(Some(List), true, false, false), Bar);
+        assert_eq!(tab_to(Some(Toolbar), true, false, true), Bar);
+        assert_eq!(tab_to(Some(Bar), true, false, false), Toolbar);
+        assert_eq!(tab_to(Some(Bar), true, false, true), List);
+    }
+
+    /// #1368: the preview pane, while it shows, comes after the list (Shift+Tab: before the bar).
+    #[test]
+    fn tab_reaches_the_preview_pane_after_the_list() {
+        use Pane::*;
+        assert_eq!(tab_to(Some(List), true, true, false), Preview);
+        assert_eq!(tab_to(Some(Preview), true, true, false), Bar);
+        assert_eq!(tab_to(Some(Bar), true, true, true), Preview);
+        assert_eq!(tab_to(Some(Preview), false, true, true), List);
+        // Hidden with the keys: on to the toolbar, as the tree.
+        assert_eq!(tab_to(Some(Preview), true, false, false), Toolbar);
     }
 }
 

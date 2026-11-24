@@ -230,6 +230,12 @@ pub struct Settings {
     /// `show_complete` stays as it is. A snooze until MDM restarts is not saved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub complete_snoozed_until: Option<i64>,
+    /// Options → Downloads: "Don't show pop-ups while a full-screen app or presentation is
+    /// running" (#1773, hold.rs): Download complete and MDM's other windows that come up by
+    /// themselves wait while a full-screen game, app or video, a presentation or the locked
+    /// screen is on, and show when the user is back. On by default, for lists saved before it
+    /// too.
+    pub hold_popups: bool,
     /// List right-click → On Double click: Open (true) or Properties (IDM default).
     pub double_click_open: bool,
     /// Ask before deleting downloads ("Don't show this dialog again" clears it). Off, Delete only
@@ -250,6 +256,11 @@ pub struct Settings {
     /// and the node last shown.
     pub show_categories: bool,
     pub branches: [bool; 4],
+    /// The preview pane beside the list (#1368, View → Preview pane, Alt+P): the selected
+    /// download's picture and details. Off unless shown.
+    pub preview_pane: bool,
+    /// Its frame's width, dragged with its splitter.
+    pub preview_width: u32,
     pub view: Option<crate::app::View>,
     /// View → Dark Mode support (IDM 6.37): follow Windows' dark app mode; off = always light.
     pub dark_mode_support: bool,
@@ -613,6 +624,7 @@ impl Default for Settings {
             many_connections: false,
             show_complete: true,
             complete_snoozed_until: None,
+            hold_popups: true,
             double_click_open: false,
             confirm_delete: true,
             categories_width: 143,
@@ -620,6 +632,8 @@ impl Default for Settings {
             window_maximized: false,
             show_categories: true,
             branches: [true, false, false, false],
+            preview_pane: false,
+            preview_width: crate::preview::DEFAULT_WIDTH,
             view: None,
             dark_mode_support: true,
             always_dark: false,
@@ -1543,6 +1557,22 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
             assert_eq!(again.tray_panel, on);
         }
+    }
+
+    /// #1773: pop-ups wait during a full-screen app, in a new list and in one saved before the
+    /// switch; turned off, it stays off across a save.
+    #[test]
+    fn pop_ups_wait_by_default_in_new_and_old_lists() {
+        use super::Settings;
+        assert!(Settings::default().hold_popups);
+        let old: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old.hold_popups, "a list saved before it");
+        let off = Settings {
+            hold_popups: false,
+            ..Settings::default()
+        };
+        let again: Settings = serde_json::from_value(serde_json::to_value(&off).unwrap()).unwrap();
+        assert!(!again.hold_popups);
     }
 
     /// #1278: the video button's size is Automatic unless Full or Compact was chosen, kept across
