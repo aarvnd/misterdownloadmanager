@@ -573,6 +573,12 @@ These ship in the next version.
   the site answers its download form with the form again, MDM waits before sending it back (half
   a second, then one, two and four seconds) instead of sending its five tries within three
   seconds, which may be what the site refused
+- ✅ `thunder://`, `flashget://` and `qqdl://` links (#1782): the ordinary address wrapped in
+  each (base64) is unwrapped and downloaded, in **Add URL**, in a link copied to the clipboard and
+  wherever links are found in text (Add batch download from clipboard, Link grabber, an imported
+  list); kept under its real address, so a wrapped and a plain link to one file are one
+  download. Only http, https, ftp and magnet addresses are taken; anything else inside is not
+  supported. Registering MDM for these link types is not done yet.
 - ✅ Pop-ups wait while a full-screen game, app or video, a presentation or the locked screen is
   on, and show when you're back, in the order they came; links from the browser and windows you
   open still show at once; **Options → Downloads** turns it off
@@ -1840,6 +1846,9 @@ These ship in the next version.
   a second or two late while the main window was out of sight (on another workspace)
 - ✅ Telegram Web's downloads stay with the browser, which makes them in the page
   ([#1345](https://github.com/anefzaoui/misterdownloadmanager/issues/1345))
+- ✅ The download button over a video in a tab left open for hours no longer says it can't tell which
+  video it is: its player's new load of the same stream counts as the same video
+  ([#1828](https://github.com/anefzaoui/misterdownloadmanager/issues/1828))
 - ✅ A video in another site's player embedded in a page is named by the page's title, not the
   player's own ("Watch file.mp4 - VOE")
   ([#1351](https://github.com/anefzaoui/misterdownloadmanager/issues/1351))
@@ -1924,6 +1933,13 @@ These ship in the next version.
   title
   ([#1407](https://github.com/anefzaoui/misterdownloadmanager/issues/1407); thanks to
   [@Seyamalam](https://github.com/Seyamalam))
+- ✅ Screen readers read the **Helpers** window: each row's name and status line were
+  painted text a reader never saw, and the buttons that repeat on every row all said the
+  same thing; every **Use another program...**, **Use MDM's own copy**, **Update** and
+  **Go back to ...** now says which helper it is for, and a row's name and status are
+  there to read
+  ([#1407](https://github.com/anefzaoui/misterdownloadmanager/issues/1407); thanks to
+  [@Seyamalam](https://github.com/Seyamalam))
 - ✅ Tests: the video checks of an address that expires while downloading (a stream's, and DASH
   pieces') no longer fail now and then on a busy computer: the test server times such a link from
   its first request, not from the look-up that gave it, so a slow start can't kill it before the
@@ -1967,6 +1983,13 @@ These ship in the next version.
   without anyone moving the focus
   ([#1406](https://github.com/anefzaoui/misterdownloadmanager/issues/1406); thanks to
   [@YairDies](https://github.com/YairDies))
+- ✅ Screen readers and voice control press MDM's round radio buttons at once: **Quick cut** /
+  **Exact cut** in **Download video**, the **Duplicate download link** choices, and every other
+  radio group published the old choice in the frame that answered UI Automation's
+  `SelectionItem.Select` (or AT-SPI's `click`), so the selection and the dot stayed where they
+  were; choosing one now redraws and publishes the group's new checked states in that same frame,
+  and the arrow keys move between **Quick cut** / **Exact cut** and **Delete category**'s choices
+  too ([#1692](https://github.com/anefzaoui/misterdownloadmanager/issues/1692))
 
 ## Being worked on
 
