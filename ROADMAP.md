@@ -571,6 +571,20 @@ These ship in the next version.
 
 - ✅ The website's robots.txt says how automated systems may use the site, with a Content
   Signals line (contentsignals.org, #1785): search, AI answers and AI training are all allowed.
+- ✅ Tests: the check that a finished file's damaged part is downloaded again no longer fails now
+  and then (seen on a Linux runner): the test server damages only the first answer that carries
+  those bytes, and the first download, on several connections, could split that answer off
+  before it got there, so the file came out whole; the first download now takes one connection
+- ✅ Move a paused or stopped download to another folder: **Move/Rename** and File Properties'
+  **Move** take a download stopped part-way too, its part file and resume state along (copied
+  then deleted on another drive, after a free space check), and it resumes there from where it
+  stopped; a move cut short by MDM closing is settled at the next start. Videos, galleries and
+  torrents still move once they're finished, and say so
+  ([#1739](https://github.com/anefzaoui/misterdownloadmanager/issues/1739))
+- ✅ Several Download File Info windows at once, one for each link, side by side: each opens a
+  step from the one before and comes to the front, its title numbered from the second on; up to
+  six, more links waiting their turn
+  ([#1741](https://github.com/anefzaoui/misterdownloadmanager/issues/1741))
 - ✅ The browser add-on's Download video button out of the way: **Automatic** size, the new
   default (round in a feed and over a small player, whole over a big one), faint as the pointer
   rests or leaves before it goes, movable outside the player and kept for each site, with
