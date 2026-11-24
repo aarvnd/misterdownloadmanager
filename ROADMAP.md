@@ -573,6 +573,10 @@ These ship in the next version.
   server for AI assistants is, with its tools read from the server's own code at each build. It
   says the server is local (a program beside the app, started by the assistant, talking only to
   the MDM on that computer) and names no hosted address; it links to the help page that sets it up
+- ✅ Website: the browser stores' ratings and users under their buttons on the home and download
+  pages, read again at every build; visitors rate MDM from one to five stars on the site (change
+  or remove their rating, keyboard and screen readers too), served by a small Cloudflare Worker
+  that keeps no IP address; only these ratings go into the structured data
 - ✅ Tests: the check that a finished file's damaged part is downloaded again no longer fails now
   and then (seen on a Linux runner): the test server damages only the first answer that carries
   those bytes, and the first download, on several connections, could split that answer off
